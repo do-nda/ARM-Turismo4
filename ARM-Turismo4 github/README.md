@@ -28,5 +28,3 @@ It contains no game code or data. You supply an ELF extracted from your own disc
 ## Porting to ARM
 Generated code and runtime use only stdint.h/string.h/stdio.h/stdlib.h and assume a
 little-endian host. Android: build with the NDK (arm64-v8a). Switch: devkitA64/libnx.
-Send me `lift_report.txt`, `missing_entries.txt` and `hw_access_log.txt` from a run and
-I can prioritise the next instructions and hardware to implement.
