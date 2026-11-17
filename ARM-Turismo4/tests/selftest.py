@@ -97,8 +97,8 @@ def build():
     a.la(A0, "data"); a.i(0x26, A0, T0, 1); a.i(0x22, A0, T0, 4); a.show(T0)
     # 8. 128-bit lq/sq copy, then read word 3 of the copy
     a.la(A0, "data"); a.la(A1, "data2"); a.i(0x1E, A0, T0, 0); a.i(0x1F, A1, T0, 0); a.lw(T1, 12, A1); a.show(T1)
-    # 9. COP1 word on a path that is analysed but never executed (must be reported)
-    a.addiu(T0, Z, 1); a.br(0x05, T0, Z, "after"); a.nop(); a.raw(0x44800000)
+    # 9. COP2 (VU0) word on a path that is analysed but never executed (must be reported)
+    a.addiu(T0, Z, 1); a.br(0x05, T0, Z, "after"); a.nop(); a.raw(0x4A000000)
     a.label("after")
     a.addiu(V1, Z, 2); a.r(0x0C)
     a.label("dbl"); a.r(0x08, RA); a.addu(V0, A0, A0)
@@ -160,7 +160,7 @@ def main():
     print("run 2 output:", got)
     assert got == want, f"\nwant {want}\ngot  {got}"
     rep = open(os.path.join(out, "lift_report.txt")).read()
-    assert "COP1(FPU)" in rep, rep
+    assert "COP2(VU0 macro)" in rep, rep
     print("PASS - all checks OK; lift report:\n" + rep)
 
 
