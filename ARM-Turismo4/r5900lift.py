@@ -72,6 +72,7 @@ class Stats:
         self.ok = 0
         self.unimpl = collections.OrderedDict()  # name -> [count, first_pc]
         self.indirect = []
+        self.sys = {}  # BIOS syscall number (or None) -> [sites, first pc]
 
     def bad(self, name, pc):
         e = self.unimpl.setdefault(name, [0, pc])
@@ -160,6 +161,10 @@ MMI_TAB = {  # (funct, sa) -> helper name. Encodings from the R5900 manual, from
 }
 
 
+MMI_SHIFT = {0x34: "psllh", 0x36: "psrlh", 0x37: "psrah",
+             0x3C: "psllw", 0x3E: "psrlw", 0x3F: "psraw"}
+
+
 def mmi(w):
     rs, rt, rd = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
     sa, fn = (w >> 6) & 31, w & 63
@@ -180,6 +185,15 @@ def mmi(w):
         return (f"{{ {sg}64 p = ({sg}64)({sg}32){RS} * ({sg}64)({sg}32){RT}; "
                 f"ctx->lo[1] = SX32(p); ctx->hi[1] = SX32(p >> 32); "
                 f"{W(rd, 'ctx->lo[1]')} }}")
+    if fn in MMI_SHIFT:
+        return "" if rd == 0 else f"ps2_{MMI_SHIFT[fn]}({d}, {t}, {sa});"
+    if fn in (0x00, 0x01, 0x20, 0x21):  # madd / maddu, pipeline 0 or 1 (3-operand form)
+        k = 1 if fn & 0x20 else 0
+        sg = "s" if fn in (0x00, 0x20) else "u"
+        return (f"{{ u64 acc = ((u64)(u32)ctx->hi[{k}] << 32) | (u32)ctx->lo[{k}]; "
+                f"acc += ({sg}64)({sg}32){RS} * ({sg}64)({sg}32){RT}; "
+                f"ctx->lo[{k}] = SX32(acc); ctx->hi[{k}] = SX32(acc >> 32); "
+                f"{W(rd, f'ctx->lo[{k}]')} }}")
     if fn == 0x1A:
         return f"ps2_div1(ctx, {RS}, {RT});"
     if fn == 0x1B:
@@ -257,6 +271,8 @@ def simple(w, pc):
             return "" if rd == 0 else f"if ({RT} {cmp_} 0) G({rd}) = {RS};"
         if fn == 0x0C:
             return f"ps2_syscall(ctx, 0x{pc:08x}u);"
+        if fn == 0x0D:
+            return f"ps2_break(ctx, 0x{pc:08x}u);"  # compilers emit this after div (trap)
         if fn == 0x0F:
             return ""  # sync
         if fn == 0x11:
@@ -372,6 +388,20 @@ def analyze(entry, code, entries):
     return flow, seen, calls
 
 
+def syscall_number(code, pc):
+    """Best-effort: the constant loaded into $v1 shortly before a `syscall`."""
+    for k in range(1, 6):
+        w = code.get(pc - 4 * k)
+        if w is None:
+            return None
+        op, rs, rt, rd = w >> 26, (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
+        if rt == 3 and op in (0x09, 0x19, 0x0D) and rs == 0:
+            return (w & 0xFFFF) if op == 0x0D else sx16(w & 0xFFFF)
+        if (op == 0 and rd == 3) or (op in IMM_D and rt == 3):
+            return None
+    return None
+
+
 def lift_function(entry, flow, code, entries, st):
     out, refs = {}, set()
 
@@ -396,6 +426,9 @@ def lift_function(entry, flow, code, entries, st):
         w = code[pc]
         c = ctrl(w, pc)
         if c is None:
+            if w >> 26 == 0 and (w & 63) == 0x0C:
+                e = st.sys.setdefault(syscall_number(code, pc), [0, pc])
+                e[0] += 1
             out[pc] = lift_simple(w, pc, True)
             if pc + 4 not in flow:
                 out[pc] += " return; /* ran off end of code */"
@@ -497,33 +530,51 @@ def main():
     ap.add_argument("--scan", action="store_true",
                     help="also discover functions heuristically (jr-ra boundaries and "
                     "function-pointer tables)")
+    ap.add_argument("--code-range", nargs=2, metavar=("LO", "HI"),
+                    help="only treat addresses in [LO, HI) (hex) as code; use "
+                    "tools/find_code_range.py to estimate it")
     ap.add_argument("--split", type=int, default=0, metavar="N",
                     help="write N functions per generated_NNN.c file (use for big inputs)")
     a = ap.parse_args()
 
     elf = Elf(open(a.elf, "rb").read())
+    if a.code_range:
+        lo, hi = (int(x, 16) for x in a.code_range)
+        elf.code = {k: v for k, v in elf.code.items() if lo <= k < hi}
+        print(f"code range       : 0x{lo:08x}-0x{hi:08x} ({len(elf.code)} words)")
     entries = {elf.entry} | read_entries(a.entries) | {int(x, 16) for x in a.add}
     for e in sorted(entries):
         if e not in elf.code:
-            print(f"warning: entry 0x{e:08x} is outside executable segments; ignored")
+            print(f"warning: entry 0x{e:08x} is outside the code range; ignored")
     entries = {e for e in entries if e in elf.code}
+    funcs, covered = {}, set()
+
+    def grow(seeds):
+        """Analyse seeds and every function they call (direct calls are strong evidence)."""
+        work = list(seeds)
+        while work:
+            e = work.pop()
+            if e in funcs or e not in elf.code:
+                continue
+            entries.add(e)
+            funcs[e] = analyze(e, elf.code, entries)
+            covered.update(funcs[e][0])
+            work.extend(c for c in funcs[e][2] if c in elf.code and c not in funcs)
+
+    grow(sorted(entries))
     seeds_msg = ""
     if a.scan:
-        sa, sb = scan_seeds(elf, entries)
-        entries |= sa | sb
-        seeds_msg = (f"scan seeds       : {len(sa)} after jr-ra boundaries, "
-                     f"{len(sb)} from pointer tables ({len(sa | sb)} unique)")
+        sa, sb = scan_seeds(elf, set(funcs))
+        grow(sorted(sb))               # code pointers: always kept
+        kept = 0
+        for sd in sorted(sa):          # jr-ra boundaries: skip if already inside a function
+            if sd not in covered and sd not in funcs:
+                grow([sd])
+                kept += 1
+        seeds_msg = (f"scan seeds       : {len(sb)} pointer-table targets; {len(sa)} jr-ra "
+                     f"boundaries ({kept} kept, rest already inside known functions)")
         print(seeds_msg)
-
-    while True:  # grow the function set to a fixpoint
-        funcs, new = {}, set()
-        for e in sorted(entries):
-            funcs[e] = analyze(e, elf.code, entries)
-            new |= funcs[e][2]
-        new = {t for t in new if t in elf.code} - entries
-        if not new:
-            break
-        entries |= new
+    entries = set(funcs)
 
     st = Stats()
     os.makedirs(a.outdir, exist_ok=True)
@@ -551,6 +602,12 @@ def main():
     tbl += [f"  {{0x{e:08x}u, f_{e:08x}}}," for e in sorted(funcs)] + ["};"]
     for name, lines in (("generated.h", hdr), ("func_table.c", tbl)):
         open(os.path.join(a.outdir, name), "w").write("\n".join(lines) + "\n")
+    open(os.path.join(a.outdir, "Makefile"), "w").write(
+        "CC ?= cc\nCFLAGS ?= -O1 -w\n"
+        "SRC := $(wildcard generated*.c) func_table.c ps2rt.c\nOBJ := $(SRC:.c=.o)\n\n"
+        "game: $(OBJ)\n\t$(CC) -o $@ $(OBJ) -lm\n\n"
+        "%.o: %.c generated.h ps2rt.h\n\t$(CC) $(CFLAGS) -c $< -o $@\n\n"
+        "clean:\n\trm -f $(OBJ) game\n")
     for name in ("ps2rt.h", "ps2rt.c"):
         data = open(os.path.join(HERE, "runtime", name)).read()
         open(os.path.join(a.outdir, name), "w").write(data)
@@ -564,13 +621,15 @@ def main():
     rep += ["", "Unimplemented instruction classes (count, first address):"]
     for name, (n, pc) in sorted(st.unimpl.items(), key=lambda kv: -kv[1][0]):
         rep.append(f"  {n:7d}  0x{pc:08x}  {name}")
+    rep += ["", "BIOS syscalls via `syscall` (number, sites, first address):"]
+    for num, (n, pc) in sorted(st.sys.items(), key=lambda kv: -kv[1][0]):
+        label = "computed at runtime" if num is None else f"{num} (0x{num & 0xFFFF:x})"
+        rep.append(f"  {n:7d}  0x{pc:08x}  {label}")
     open(os.path.join(a.outdir, "lift_report.txt"), "w").write("\n".join(rep) + "\n")
     print("\n".join(rep[:5 if seeds_msg else 4]))
     if st.unimpl:
         print(f"{len(st.unimpl)} unimplemented instruction classes -> see lift_report.txt")
-    print("build: cc -O1 -o game " + " ".join(f"{a.outdir}/{c}" for c in cfiles[:2])
-          + (" ... " if len(cfiles) > 2 else " ") + f"{a.outdir}/func_table.c "
-          f"{a.outdir}/ps2rt.c -lm   (compile all {len(cfiles)} generated file(s))")
+    print(f"build: make -C {a.outdir} -j8   (add CFLAGS=-O0 for a faster, unoptimised build)")
 
 
 if __name__ == "__main__":

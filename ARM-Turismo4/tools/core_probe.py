@@ -88,7 +88,9 @@ def build_elf(buf, main):
                        len(secs), 0, 0, 0)
     ph, body = b"", b""
     for tgt, size, src in secs:
-        ph += struct.pack("<8I", 1, off + len(body), tgt, tgt, size, size, 7, 16)
+        # only the section holding the entry point is executable; the rest is data
+        flags = 7 if tgt <= main["entry"] < tgt + size else 6
+        ph += struct.pack("<8I", 1, off + len(body), tgt, tgt, size, size, flags, 16)
         body += buf[src:src + size]
     return hdr + ph + body
 
