@@ -44,6 +44,9 @@ void ps2_unimpl(Ctx *ctx, u32 pc, u32 word);
 void ps2_syscall(Ctx *ctx, u32 pc);
 u8  *ps2_hw_access(Ctx *ctx, u32 addr);
 
+/* BREAK is only reached on a trapped condition (e.g. divide by zero): treat as fatal. */
+static inline void ps2_break(Ctx *ctx, u32 pc) { ps2_unimpl(ctx, pc, 0x0Du); }
+
 /* Address translation. Hardware registers (GS, DMA, VIF, ...) are NOT modelled
  * yet: they hit ps2_hw_access(), which logs the address. */
 static inline u8 *ps2_ptr(Ctx *ctx, u32 a) {
@@ -190,6 +193,16 @@ MMI_BIN(paddub, b, u8, 16, (u32)x + y > 0xFFu ? 0xFFu : (u32)x + y)
 MMI_BIN(psubub, b, u8, 16, x > y ? x - y : 0)
 MMI_BIN(pabsw, sw, s32, 4, y < 0 ? (y == INT32_MIN ? INT32_MAX : -y) : y)
 MMI_BIN(pabsh, sh, s16, 8, y < 0 ? (y == -32768 ? 32767 : -y) : y)
+
+#define MMI_SHIFT(name, lane, T, N, MASK, EXPR) \
+    static inline void ps2_##name(u128 *d, const u128 *t, u32 sa) { \
+        V128 b, r; memcpy(&b, t, 16); sa &= (MASK); \
+        for (int i = 0; i < (N); i++) { T y = b.lane[i]; r.lane[i] = (T)(EXPR); } \
+        memcpy(d, &r, 16); }
+MMI_SHIFT(psllh, h, u16, 8, 15, (u32)y << sa)   MMI_SHIFT(psrlh, h, u16, 8, 15, y >> sa)
+MMI_SHIFT(psrah, sh, s16, 8, 15, y >> sa)
+MMI_SHIFT(psllw, w, u32, 4, 31, y << sa)        MMI_SHIFT(psrlw, w, u32, 4, 31, y >> sa)
+MMI_SHIFT(psraw, sw, s32, 4, 31, y >> sa)
 
 #define MMI_LOAD V128 a, b, r; memcpy(&a, s, 16); memcpy(&b, t, 16); (void)a; (void)b;
 static inline void ps2_pextlw(u128 *d, const u128 *s, const u128 *t) {
