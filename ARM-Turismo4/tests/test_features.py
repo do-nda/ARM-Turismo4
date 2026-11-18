@@ -103,6 +103,32 @@ def features():
     a.raw(mmi(0x04, 0, T2, T3, 0)); a.i(0x1F, A1, T2, 0)             # plzcw
     for i, v in enumerate((15, 3)):
         a.lw(T1, 4 * i, A1); a.show(T1); want.append(v)
+    M32 = 0xFFFFFFFF
+
+    def h16(f):
+        return [(f((x >> 16) & 0xFFFF) << 16 | f(x & 0xFFFF)) & M32 for x in A]
+
+    def sx16(v):
+        return v - 0x10000 if v & 0x8000 else v
+    shifts = [
+        (0x3C, 4, [(x << 4) & M32 for x in A]),                       # psllw
+        (0x3E, 1, [x >> 1 for x in A]),                               # psrlw
+        (0x3F, 1, [(s32(x) >> 1) & M32 for x in A]),                  # psraw
+        (0x34, 8, h16(lambda v: (v << 8) & 0xFFFF)),                  # psllh
+        (0x36, 4, h16(lambda v: v >> 4)),                             # psrlh
+        (0x37, 4, h16(lambda v: (sx16(v) >> 4) & 0xFFFF)),            # psrah
+    ]
+    for fn, sa, exp in shifts:
+        a.raw(mmi(fn, sa, T2, 0, T0)); a.i(0x1F, A1, T2, 0)
+        for i, v in enumerate(exp):
+            a.lw(T3, 4 * i, A1); a.show(T3); want.append(s32(v))
+    # madd / maddu (pipeline 0) and mult1 + madd1 (pipeline 1)
+    a.addiu(T3, Z, 6); a.addiu(T1, Z, 7)
+    a.r(0x18, T3, T1, T2); a.raw(mmi(0x00, 0, T0, T3, T1)); a.show(T0); want.append(84)
+    a.raw(mmi(0x01, 0, T0, T3, T1)); a.show(T0); want.append(126)
+    a.raw(mmi(0x18, 0, T2, T3, T1)); a.raw(mmi(0x20, 0, T0, T3, T1)); a.show(T0); want.append(84)
+    a.addiu(T3, Z, -3); a.raw(mmi(0x20, 0, T0, T3, T1)); a.show(T0); want.append(63)
+    # syscall inventory: show() issues `addiu v1,zero,1; syscall`
     a.addiu(V1, Z, 2); a.r(0x0C)
     while a.pc() % 16:
         a.nop()
@@ -143,6 +169,13 @@ def main():
     for name in ("LDL", "LDR", "SDL", "SDR", "COP0", "COP1", "MMI", "LWC1", "SWC1"):
         assert name not in rpt, f"{name} still unimplemented:\n{rpt}"
     print("features: none of the new instruction classes are reported as unimplemented")
+    m = [l for l in rpt.splitlines() if "(0x1)" in l or "(0x2)" in l]
+    assert len(m) == 2 and "(0x1)" in m[0], f"syscall inventory wrong: {m}\n{rpt}"
+    print("features: BIOS syscall inventory lists syscalls 1 and 2")
+    assert os.path.exists(os.path.join(tmp, "out", "Makefile"))
+    mk = sh(["make", "-C", os.path.join(tmp, "out"), "-s", "clean", "game"])
+    print("features: generated Makefile builds" if mk.returncode == 0 else
+          f"(make unavailable or failed: {mk.stderr[:80]})")
 
     tmp2 = tempfile.mkdtemp(prefix="ps2_scan_")
     s = scan_case()
