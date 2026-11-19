@@ -34,7 +34,7 @@ def sh(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def lift_build_run(tmp, elf, extra=()):
+def lift_build_run(tmp, elf, extra=(), env=None):
     out = os.path.join(tmp, "out")
     r = sh([sys.executable, os.path.join(ROOT, "r5900lift.py"), elf, "-o", out, *extra])
     assert r.returncode == 0, r.stderr + r.stdout
@@ -43,7 +43,7 @@ def lift_build_run(tmp, elf, extra=()):
            + [os.path.join(out, f) for f in sorted(os.listdir(out)) if f.endswith(".c")]
            + ["-lm"])
     assert c.returncode == 0, c.stderr
-    return r, sh([os.path.join(tmp, "game"), elf], cwd=tmp)
+    return r, sh([os.path.join(tmp, "game"), elf], cwd=tmp, env=env)
 
 
 def features():
@@ -145,6 +145,8 @@ def features():
     # syscall inventory: show() issues `addiu v1,zero,1; syscall`
     # guest kernel-mode handlers installed with SetSyscall (0x74), one returning via ERET
     a.addiu(V1, Z, 0x74); a.addiu(A0, Z, 0x83); a.la(A1, "h1"); a.r(0x0C)
+    a.i(0x0F, 0, T0, 0x8000); a.i(0x0D, T0, T0, 0x2000 + 4 * 0x83)       # kernel-space slot address
+    a.lw(T1, 0, T0); a.show(T1); want.append(("label", "h1"))             # table holds the handler
     a.addiu(V1, Z, 0x83); a.addiu(A0, Z, 5); a.r(0x0C); a.show(V0); want.append(10)
     a.addiu(V1, Z, 0x74); a.addiu(A0, Z, 0x5A); a.la(A1, "h2"); a.r(0x0C)
     a.addiu(V1, Z, 0x5A); a.r(0x0C); a.show(V0); want.append(77)
@@ -176,6 +178,7 @@ def scan_case():
 def main():
     tmp = tempfile.mkdtemp(prefix="ps2_feat_")
     a, want = features()
+    want = [a.labels[x[1]] if isinstance(x, tuple) else x for x in want]
     words = a.done()
     elf = os.path.join(tmp, "f.elf")
     T.write_elf(elf, words, a.labels["_start"])
@@ -218,6 +221,15 @@ def main():
     _, run = lift_build_run(tmp2, elf2, ["--scan", "--split", "1"])
     assert run.returncode == 0 and run.stdout.split() == ["12"], run.stderr + run.stdout
     print("scan: function behind a pointer table found by --scan (and missed without it)")
+    # watchdog: an endless guest loop must be reported, not hang
+    tmp3 = tempfile.mkdtemp(prefix="ps2_wd_")
+    w = T.Asm()
+    w.label("_start"); w.addiu(T0, Z, 1); w.label("L"); w.br(0x05, T0, Z, "L"); w.nop()
+    elf3 = os.path.join(tmp3, "w.elf")
+    T.write_elf(elf3, w.done(), w.labels["_start"])
+    _, run = lift_build_run(tmp3, elf3, env={**os.environ, "PS2_WATCHDOG": "1"})
+    assert run.returncode == 8 and "spinning" in run.stderr, (run.returncode, run.stderr)
+    print("watchdog: an endless guest loop is detected and reported")
     print("PASS")
 
 

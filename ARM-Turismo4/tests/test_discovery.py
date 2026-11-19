@@ -11,7 +11,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import selftest as T  # noqa: E402
-from selftest import A0, T0, T1, T2, V0, V1, Z, RA  # noqa: E402
+from selftest import A0, T0, T1, T2, T3, V0, V1, Z, RA  # noqa: E402
 
 
 def sh(cmd, **kw):
@@ -47,6 +47,27 @@ def jumptable_program():
     while a.pc() % 16:
         a.nop()
     a.label("table"); a.w += [0, 0, 0, 0]
+    return a
+
+
+def blob_program():
+    a = T.Asm()
+    a.label("_start")
+    a.la(T0, "blobsrc"); a.i(0x0F, 0, T1, 0x8007); a.i(0x0D, T1, T1, 0x6000); a.addiu(T2, Z, 8)
+    a.label("cp"); a.lw(T3, 0, T0); a.i(0x2B, T1, T3, 0)                    # copy 8 words
+    a.addiu(T0, T0, 4); a.addiu(T1, T1, 4); a.addiu(T2, T2, -1)
+    a.br(0x05, T2, Z, "cp"); a.nop()
+    a.addiu(A0, Z, 20); a.i(0x0F, 0, T0, 0x8007); a.i(0x0D, T0, T0, 0x6000)
+    a.r(0x09, T0, 0, RA); a.nop(); a.show(V0)                               # call the copy
+    a.addiu(V1, Z, 0x7001); a.r(0x0C)
+    while a.pc() % 16:
+        a.nop()
+    a.label("blobsrc")
+    d = 0x80076000
+    a.w += [(9 << 26) | (A0 << 21) | (V0 << 16) | 1,        # addiu v0,a0,1
+            (3 << 26) | (((d + 0x14) >> 2) & 0x3FFFFFF),    # jal helper (absolute, at DEST)
+            0, 0x03E00008, 0,                               # nop; jr ra; nop
+            0x00421021, 0x03E00008, 0]                      # helper: addu v0,v0,v0; jr ra; nop
     return a
 
 
@@ -95,6 +116,18 @@ def main():
     _, _, run = build_and_run(tmp3, elf3, ["--scan"])
     assert run.returncode == 0 and run.stdout.split() == ["30"], run.stderr + run.stdout
     print("jump-table: switch targets seeded from the table by --scan (and missed without it)")
+
+    # runtime-copied code: lifted from its image location as code at the destination address
+    tmp4 = tempfile.mkdtemp(prefix="ps2_blob_")
+    b = blob_program()
+    elf4 = os.path.join(tmp4, "b.elf")
+    T.write_elf(elf4, b.done(), b.labels["_start"])
+    _, _, run = build_and_run(tmp4, elf4, [])
+    assert run.returncode == 3, "without --blob the copied code is unknown to the lifter"
+    os.remove(os.path.join(tmp4, "missing_entries.txt"))
+    _, out, run = build_and_run(tmp4, elf4, ["--blob", hex(b.labels["blobsrc"]), "32", "0x80076000"])
+    assert run.returncode == 0 and run.stdout.split() == ["42"], run.stderr + run.stdout
+    print("blob: runtime-copied code lifted at its destination address and executed")
 
     # find_code_range on clean code followed by random data
     rnd = random.Random(1)

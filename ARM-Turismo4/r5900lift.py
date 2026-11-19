@@ -587,6 +587,10 @@ def main():
     ap.add_argument("--code-range", nargs=2, metavar=("LO", "HI"),
                     help="only treat addresses in [LO, HI) (hex) as code; use "
                     "tools/find_code_range.py to estimate it")
+    ap.add_argument("--blob", nargs=3, action="append", default=[],
+                    metavar=("SRC", "SIZE", "DEST"),
+                    help="code the game copies around at runtime: lift SIZE bytes found at SRC "
+                    "in the image as code located at DEST (repeatable)")
     ap.add_argument("--split", type=int, default=0, metavar="N",
                     help="write N functions per generated_NNN.c file (use for big inputs)")
     a = ap.parse_args()
@@ -604,7 +608,17 @@ def main():
         lo, hi = (int(x, 16) for x in a.code_range)
         elf.code = {k: v for k, v in elf.code.items() if lo <= k < hi}
         print(f"code range       : 0x{lo:08x}-0x{hi:08x} ({len(elf.code)} words)")
-    entries = {elf.entry} | read_entries(a.entries) | {int(x, 16) for x in a.add}
+    blob_entries = set()
+    for b in a.blob:
+        src, size, dest = (int(x, 0) for x in b)
+        for off in range(0, size, 4):
+            if src + off not in elf.data:
+                sys.exit(f"error: blob source 0x{src + off:08x} is not inside the image")
+            elf.code[dest + off] = elf.data[src + off]
+        blob_entries.add(dest)
+        print(f"blob             : 0x{size:x} bytes from 0x{src:08x} lifted as code at 0x{dest:08x}")
+    entries = ({elf.entry} | read_entries(a.entries) | {int(x, 16) for x in a.add}
+               | blob_entries)
     for e in sorted(entries):
         if e not in elf.code:
             print(f"warning: entry 0x{e:08x} is outside the code range; ignored")
@@ -662,14 +676,16 @@ def main():
            f"const u32 ps2_entry_addr = 0x{elf.entry:08x}u;",
            f"const u32 ps2_func_count = {len(funcs)};",
            "const PS2FuncEntry ps2_func_table[] = {"]
-    tbl += [f"  {{0x{e:08x}u, f_{e:08x}}}," for e in sorted(funcs)] + ["};"]
+    # keys are physical-style (KUSEG/KSEG0/KSEG1 aliases of one address share a key)
+    tbl += [f"  {{0x{e & 0x1FFFFFFF:08x}u, f_{e:08x}}},"
+            for e in sorted(funcs, key=lambda x: x & 0x1FFFFFFF)] + ["};"]
     for name, lines in (("generated.h", hdr), ("func_table.c", tbl)):
         write_if_changed(os.path.join(a.outdir, name), "\n".join(lines) + "\n")
     write_if_changed(os.path.join(a.outdir, "Makefile"),
-        "CC ?= cc\nCFLAGS ?= -O1 -w\n"
+        "CC ?= cc\nCFLAGS ?= -O1 -w\nLDFLAGS ?= -rdynamic\n"
         "SRC := $(wildcard generated*.c) func_table.c ps2rt.c\nOBJ := $(SRC:.c=.o)\n\n"
-        "game: $(OBJ)\n\t$(CC) -o $@ $(OBJ) -lm\n\n"
-        "%.o: %.c generated.h ps2rt.h\n\t$(CC) $(CFLAGS) -c $< -o $@\n\n"
+        "game: $(OBJ)\n\t$(CC) $(LDFLAGS) -o $@ $(OBJ) -lm\n\n"
+        "%.o: %.c ps2rt.h\n\t$(CC) $(CFLAGS) -c $< -o $@\n\n"
         "clean:\n\trm -f $(OBJ) game\n")
     for name in ("ps2rt.h", "ps2rt.c"):
         write_if_changed(os.path.join(a.outdir, name),

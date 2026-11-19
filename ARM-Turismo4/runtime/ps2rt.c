@@ -8,10 +8,17 @@
  * Every syscall is traced to syscall_trace.log. Anything needing guest threads, the
  * IOP or real hardware stops the run with exit code 5/6/7 and a message. Set
  * PS2_LENIENT=1 to let unknown syscalls return 0 instead of stopping. */
+#define _POSIX_C_SOURCE 200809L
 #include "ps2rt.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__GLIBC__)
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+#define PS2_WATCHDOG 1
+#endif
 
 /* ------------------------------------------------------------------ tracing */
 static FILE *g_trace;
@@ -84,7 +91,35 @@ static struct {
     struct { int used; u32 func, stack, stack_size, gp, prio; } th[256];
 } K = { .next_hid = 1, .next_tid = 2 };
 
-static u32 user_sys[256];   /* guest handlers installed with SetSyscall, by syscall number */
+#ifdef PS2_WATCHDOG
+/* If no syscall happens for PS2_WATCHDOG seconds (default 20) the guest is almost certainly
+ * spinning on something unmodelled: print the host call stack (guest functions are named
+ * f_<address>) and exit with code 8. Needs -rdynamic for names; set PS2_WATCHDOG=0 to disable. */
+static unsigned long g_wd_last = ~0UL;
+static unsigned g_wd_secs = 20;
+static void on_alarm(int sig) {
+    static const char msg[] = "\nps2rt: no syscall for a while - the guest is probably spinning "
+                              "on something unmodelled.\nGuest call stack, innermost first "
+                              "(f_<guest address>):\n";
+    void *bt[24];
+    int n;
+    (void)sig;
+    if (g_syscalls == g_wd_last) {
+        n = backtrace(bt, 24);
+        if (write(2, msg, sizeof msg - 1) < 0) _exit(8);
+        backtrace_symbols_fd(bt, n, 2);
+        _exit(8);
+    }
+    g_wd_last = g_syscalls;
+    alarm(g_wd_secs);
+}
+#endif
+
+/* Fake kernel syscall table, visible to the guest (kernel addresses map onto low RAM).
+ * SetSyscall(n, fn) stores fn at KSYSTAB + 4*n; dispatch reads handlers back from here.
+ * The game's startup code scans kernel memory for these words to find and patch the slots,
+ * so the table must really exist in guest memory. The base address is a guess. */
+#define KSYSTAB 0x80002000u
 
 static void words(Ctx *c, u32 a, int n, char *out, size_t cap) {
     int i; size_t k = 0;
@@ -124,12 +159,15 @@ void ps2_syscall(Ctx *ctx, u32 pc) {
         fatal(7, "over %lu syscalls: probably spinning on something unmodelled", SYSCALL_LIMIT);
     name = sys_name(n);
 
-    if (n != 0x74 && n < 256 && user_sys[n]) {   /* the game replaced this syscall: run its code */
-        trace("pc=0x%08x %s(%d) a0=%08x a1=%08x a2=%08x a3=%08x -> guest handler 0x%08x",
-              pc, name ? name : "?", raw, a0, a1, a2, a3, user_sys[n]);
-        ps2_dispatch(ctx, user_sys[n]);
-        trace("    guest handler returned v0=%llx", (unsigned long long)G(2));
-        return;
+    {
+        u32 h = n < 256 ? ps2_rd32(ctx, KSYSTAB + 4u * (u32)n) : 0;
+        if (n != 0x74 && h) {                       /* the game replaced this syscall: run its code */
+            trace("pc=0x%08x %s(%d) a0=%08x a1=%08x a2=%08x a3=%08x -> guest handler 0x%08x",
+                  pc, name ? name : "?", raw, a0, a1, a2, a3, h);
+            ps2_dispatch(ctx, h);
+            trace("    guest handler returned v0=%llx", (unsigned long long)G(2));
+            return;
+        }
     }
 
     switch (n) {
@@ -151,7 +189,9 @@ void ps2_syscall(Ctx *ctx, u32 pc) {
     case 0x70: ret = K.gs_imr; ret64 = 1; break;                  /* GsGetIMR */
     case 0x71: K.gs_imr = ((u64)a1 << 32) | a0; break;            /* GsPutIMR (64-bit arg) */
     case 0x73: K.vsync_flag = a0; K.vsync_csr = a1; break;        /* SetVSyncFlag */
-    case 0x74: if (a0 < 256) user_sys[a0] = a1; break;            /* SetSyscall: remember the guest handler */
+    case 0x74:                                                    /* SetSyscall: store in the fake table */
+        if (a0 < 256) ps2_wr32(ctx, KSYSTAB + 4u * a0, a1);
+        break;
     case 0x01: case 0x02: break;                                  /* ResetEE, SetGsCrt */
     case 0x10: case 0x12:                                         /* Add{Intc,Dmac}Handler */
         ret = add_handler(a0, a1, a3, n == 0x12); break;
@@ -292,12 +332,13 @@ static int load_elf(Ctx *ctx, const char *path) {
 }
 
 void ps2_dispatch(Ctx *ctx, u32 addr) {
+    u32 key = addr & 0x1FFFFFFFu;       /* KUSEG/KSEG0/KSEG1 aliases share one function */
     u32 lo = 0, hi = ps2_func_count;
     while (lo < hi) {
         u32 m = (lo + hi) / 2;
-        if (ps2_func_table[m].addr < addr) lo = m + 1; else hi = m;
+        if (ps2_func_table[m].addr < key) lo = m + 1; else hi = m;
     }
-    if (lo < ps2_func_count && ps2_func_table[lo].addr == addr) {
+    if (lo < ps2_func_count && ps2_func_table[lo].addr == key) {
         ps2_func_table[lo].fn(ctx);
         return;
     }
@@ -327,6 +368,20 @@ int main(int argc, char **argv) {
     if (!ctx->ram || load_elf(ctx, argv[1]) != 0) return 1;
     G(29) = 0x01FFFF00u;                    /* initial $sp (the kernel resets it via InitMainThread) */
     trace("start: entry 0x%08x, image end 0x%08x", ps2_entry_addr, K.image_end);
+#ifdef PS2_WATCHDOG
+    {
+        const char *e = getenv("PS2_WATCHDOG");
+        if (e) g_wd_secs = (unsigned)atoi(e);
+        if (g_wd_secs) {
+            struct sigaction act;
+            memset(&act, 0, sizeof act);
+            act.sa_handler = on_alarm;
+            sigemptyset(&act.sa_mask);
+            sigaction(SIGALRM, &act, NULL);     /* not signal(): strict POSIX makes it one-shot */
+            alarm(g_wd_secs);
+        }
+    }
+#endif
     ps2_dispatch(ctx, ps2_entry_addr);
     fprintf(stderr, "ps2rt: entry function returned\n");
     return 0;
