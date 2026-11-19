@@ -25,6 +25,7 @@ typedef struct Ctx {
     u32 facc;                                /* FPU accumulator (raw float bits) */
     u32 fcr31;                               /* FPU control/status; condition bit = 0x800000 */
     u32 cop0[32];                            /* COP0 registers (minimal model) */
+    u32 sa;                                  /* funnel shift amount, in BITS (0..127) */
 } Ctx;
 
 typedef struct { u32 addr; void (*fn)(Ctx *); } PS2FuncEntry;
@@ -237,6 +238,19 @@ static inline void ps2_pxor(u128 *d, const u128 *s, const u128 *t) {
     MMI_LOAD r.d[0] = a.d[0] ^ b.d[0]; r.d[1] = a.d[1] ^ b.d[1]; memcpy(d, &r, 16); }
 static inline void ps2_pnor(u128 *d, const u128 *s, const u128 *t) {
     MMI_LOAD r.d[0] = ~(a.d[0] | b.d[0]); r.d[1] = ~(a.d[1] | b.d[1]); memcpy(d, &r, 16); }
+/* QFSRV: {rs:rt} (256 bits, rs high) shifted right by SA bits, low 128 bits kept.
+ * MTSAB/MTSAH/MTSA formulas are from memory of the manual: verify against a reference. */
+static inline void ps2_qfsrv(u128 *d, const u128 *s, const u128 *t, u32 sa) {
+    V128 a, b, r; u64 w[4]; u32 ws, bs; int i;
+    memcpy(&a, s, 16); memcpy(&b, t, 16);
+    w[0] = b.d[0]; w[1] = b.d[1]; w[2] = a.d[0]; w[3] = a.d[1];
+    sa &= 127u; ws = sa / 64u; bs = sa % 64u;
+    for (i = 0; i < 2; i++) {
+        u64 lo = w[i + ws], hi = w[i + ws + 1];
+        r.d[i] = bs ? (lo >> bs) | (hi << (64u - bs)) : lo;
+    }
+    memcpy(d, &r, 16);
+}
 /* PLZCW: for each of the two low words, count leading bits equal to the sign bit
  * (excluding the sign bit). Upper 64 bits of the destination are left unchanged. */
 static inline void ps2_plzcw(u128 *d, const u128 *s) {

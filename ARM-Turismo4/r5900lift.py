@@ -85,11 +85,18 @@ def describe(w):
         return f"SPECIAL funct=0x{w & 63:02x}"
     if op == 1:
         return f"REGIMM rt=0x{(w >> 16) & 31:02x}"
+    rs = (w >> 21) & 31
+    if op in (0x10, 0x12) and rs >= 0x10:  # coprocessor "CO" instructions: funct selects the op
+        extra = f" bits10_6=0x{(w >> 6) & 31:02x}" if (w & 63) >= 0x3C else ""
+        return f"{'COP0' if op == 0x10 else 'COP2 (VU0 macro)'} CO funct=0x{w & 63:02x}{extra}"
     cop = {0x10: "COP0", 0x11: "COP1(FPU)", 0x12: "COP2(VU0 macro)"}
     if op in cop:
-        return f"{cop[op]} rs/fmt=0x{(w >> 21) & 31:02x}"
+        return f"{cop[op]} rs/fmt=0x{rs:02x}"
     if op == 0x1C:
-        return f"MMI funct=0x{w & 63:02x}"
+        fn = w & 63
+        if fn in (0x08, 0x09, 0x28, 0x29):
+            return f"MMI funct=0x{fn:02x} sa=0x{(w >> 6) & 31:02x}"
+        return f"MMI funct=0x{fn:02x}"
     names = {0x1A: "LDL", 0x1B: "LDR", 0x2C: "SDL", 0x2D: "SDR", 0x31: "LWC1",
              0x39: "SWC1", 0x36: "LQC2", 0x3E: "SQC2"}
     return names.get(op, f"opcode 0x{op:02x}")
@@ -198,6 +205,8 @@ def mmi(w):
         return f"ps2_div1(ctx, {RS}, {RT});"
     if fn == 0x1B:
         return f"ps2_divu1(ctx, {RS}, {RT});"
+    if (fn, sa) == (0x28, 0x1B):  # qfsrv: funnel shift right by SA
+        return "" if rd == 0 else f"ps2_qfsrv({d}, {s_}, {t}, ctx->sa);"
     name = MMI_TAB.get((fn, sa))
     if name:
         return "" if rd == 0 else f"ps2_{name}({d}, {s_}, {t});"
@@ -275,6 +284,10 @@ def simple(w, pc):
             return f"ps2_break(ctx, 0x{pc:08x}u);"  # compilers emit this after div (trap)
         if fn == 0x0F:
             return ""  # sync
+        if fn == 0x28:  # mfsa
+            return W(rd, "(u64)ctx->sa")
+        if fn == 0x29:  # mtsa
+            return f"ctx->sa = (u32){RS} & 0x7Fu;"
         if fn == 0x11:
             return f"HI = {RS};"
         if fn == 0x13:
@@ -288,6 +301,10 @@ def simple(w, pc):
         if fn == 0x1B:
             return f"ps2_divu(ctx, {RS}, {RT});"
         return None
+    if op == 1 and rt == 0x18:  # mtsab: SA (in bits) = byte count
+        return f"ctx->sa = (((u32){RS} & 0xFu) ^ {imm & 0xF}u) << 3;"
+    if op == 1 and rt == 0x19:  # mtsah: SA (in bits) = halfword count
+        return f"ctx->sa = (((u32){RS} & 0x7u) ^ {imm & 0x7}u) << 4;"
     if op == 0x0F:  # lui, constant folded
         return W(rt, f"0x{(sx32(imm << 16)) & (2**64 - 1):x}ull")
     if op in IMM_D:
@@ -321,6 +338,13 @@ def ctrl(w, pc):
     simm = sx16(w & 0xFFFF)
     tgt = (pc + 4 + (simm << 2)) & 0xFFFFFFFF
     RS, RT = M(rs), M(rt)
+    if op == 0x10:
+        if rs == 0x10 and (w & 63) == 0x18:      # eret: returns from a (guest) kernel handler
+            return dict(kind="eret")
+        if rs == 8 and rt in (0, 1, 2, 3):        # bc0f/bc0t: condition modelled as always true
+            return dict(kind="cond", tgt=tgt, cond="0" if rt in (0, 2) else "1",
+                        likely=rt in (2, 3))
+        return None
     if op == 0:
         fn = w & 63
         if fn == 8:
@@ -367,7 +391,7 @@ def analyze(entry, code, entries):
                 continue
             seen.add(pc + 4)
             k = c["kind"]
-            if k in ("ret", "jr"):
+            if k in ("ret", "jr", "eret"):
                 break
             if k == "j":
                 t = c["tgt"]
@@ -440,7 +464,9 @@ def lift_function(entry, flow, code, entries, st):
         after = go(nxt) if nxt in flow else "return;"
         link = f"G(31) = 0x{pc + 8:x}u;"
         k = c["kind"]
-        if k == "ret":
+        if k == "eret":
+            out[pc] = "return;"
+        elif k == "ret":
             out[pc] = f"{{ {dl} return; }}"
         elif k == "jr":
             st.indirect.append((pc, "jr"))
@@ -506,7 +532,33 @@ def scan_seeds(elf, entries):
         if lo <= v < hi and v % 4 == 0 and code.get(v, 0) != 0:
             if (code.get(v - 8) == JR_RA or code.get(v - 4) == 0) and plausible(code[v], v):
                 b_set.add(v)
-    return a_set - entries, b_set - entries
+    # (c) runs of >= 3 consecutive code pointers in data: switch tables and vtables.
+    # Their targets are case labels / methods, usually not function starts.
+    c_set, run = set(), []
+
+    def flush():
+        if len(run) >= 3:
+            c_set.update(v for _, v in run)
+
+    for addr in sorted(data):
+        v = data[addr]
+        ok = lo <= v < hi and v % 4 == 0 and code.get(v, 0) != 0 and plausible(code[v], v)
+        if ok and run and addr == run[-1][0] + 4:
+            run.append((addr, v))
+        else:
+            flush()
+            run = [(addr, v)] if ok else []
+    flush()
+    return a_set - entries, b_set - entries, c_set - entries
+
+
+def write_if_changed(path, text):
+    try:
+        if open(path).read() == text:
+            return
+    except OSError:
+        pass
+    open(path, "w").write(text)
 
 
 def read_entries(path):
@@ -521,8 +573,10 @@ def read_entries(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("elf")
+    ap.add_argument("elf", nargs="?")
     ap.add_argument("-o", "--outdir", default="out")
+    ap.add_argument("--sync-runtime", metavar="DIR",
+                    help="only copy runtime/ps2rt.{h,c} into DIR (skips the slow lift)")
     ap.add_argument("--entries", help="file of extra function entry addresses "
                     "(e.g. the runtime's missing_entries.txt)")
     ap.add_argument("--add", action="append", default=[],
@@ -536,6 +590,14 @@ def main():
     ap.add_argument("--split", type=int, default=0, metavar="N",
                     help="write N functions per generated_NNN.c file (use for big inputs)")
     a = ap.parse_args()
+    if a.sync_runtime:
+        for name in ("ps2rt.h", "ps2rt.c"):
+            write_if_changed(os.path.join(a.sync_runtime, name),
+                             open(os.path.join(HERE, "runtime", name)).read())
+        print(f"runtime files synced into {a.sync_runtime}")
+        return
+    if not a.elf:
+        ap.error("the ELF argument is required")
 
     elf = Elf(open(a.elf, "rb").read())
     if a.code_range:
@@ -564,35 +626,36 @@ def main():
     grow(sorted(entries))
     seeds_msg = ""
     if a.scan:
-        sa, sb = scan_seeds(elf, set(funcs))
-        grow(sorted(sb))               # code pointers: always kept
+        sa, sb, sc = scan_seeds(elf, set(funcs))
+        grow(sorted(sb | sc))          # code pointers and table entries: always kept
         kept = 0
         for sd in sorted(sa):          # jr-ra boundaries: skip if already inside a function
             if sd not in covered and sd not in funcs:
                 grow([sd])
                 kept += 1
-        seeds_msg = (f"scan seeds       : {len(sb)} pointer-table targets; {len(sa)} jr-ra "
-                     f"boundaries ({kept} kept, rest already inside known functions)")
+        seeds_msg = (f"scan seeds       : {len(sb)} pointer targets, {len(sc)} jump-table/vtable "
+                     f"entries; {len(sa)} jr-ra boundaries ({kept} kept, rest already inside "
+                     f"known functions)")
         print(seeds_msg)
     entries = set(funcs)
 
     st = Stats()
     os.makedirs(a.outdir, exist_ok=True)
-    for old in os.listdir(a.outdir):  # stale output would cause duplicate symbols
-        if old.startswith("generated") and old.endswith(".c"):
-            os.remove(os.path.join(a.outdir, old))
     texts = [lift_function(e, funcs[e][0], elf.code, entries, st) for e in sorted(funcs)]
     cfiles = []
     if a.split > 0:
         for i in range(0, len(texts), a.split):
             name = f"generated_{i // a.split:03d}.c"
-            open(os.path.join(a.outdir, name), "w").write(
-                '#include "generated.h"\n\n' + "\n".join(texts[i:i + a.split]) + "\n")
+            write_if_changed(os.path.join(a.outdir, name),
+                             '#include "generated.h"\n\n' + "\n".join(texts[i:i + a.split]) + "\n")
             cfiles.append(name)
     else:
-        open(os.path.join(a.outdir, "generated.c"), "w").write(
-            '#include "generated.h"\n\n' + "\n".join(texts) + "\n")
+        write_if_changed(os.path.join(a.outdir, "generated.c"),
+                         '#include "generated.h"\n\n' + "\n".join(texts) + "\n")
         cfiles.append("generated.c")
+    for old in os.listdir(a.outdir):  # stale files would cause duplicate symbols
+        if old.startswith("generated") and old.endswith(".c") and old not in cfiles:
+            os.remove(os.path.join(a.outdir, old))
     hdr = ['#include "ps2rt.h"', ""]
     hdr += [f"void f_{e:08x}(Ctx *ctx);" for e in sorted(funcs)]
     tbl = ['#include "generated.h"', "",
@@ -601,16 +664,16 @@ def main():
            "const PS2FuncEntry ps2_func_table[] = {"]
     tbl += [f"  {{0x{e:08x}u, f_{e:08x}}}," for e in sorted(funcs)] + ["};"]
     for name, lines in (("generated.h", hdr), ("func_table.c", tbl)):
-        open(os.path.join(a.outdir, name), "w").write("\n".join(lines) + "\n")
-    open(os.path.join(a.outdir, "Makefile"), "w").write(
+        write_if_changed(os.path.join(a.outdir, name), "\n".join(lines) + "\n")
+    write_if_changed(os.path.join(a.outdir, "Makefile"),
         "CC ?= cc\nCFLAGS ?= -O1 -w\n"
         "SRC := $(wildcard generated*.c) func_table.c ps2rt.c\nOBJ := $(SRC:.c=.o)\n\n"
         "game: $(OBJ)\n\t$(CC) -o $@ $(OBJ) -lm\n\n"
         "%.o: %.c generated.h ps2rt.h\n\t$(CC) $(CFLAGS) -c $< -o $@\n\n"
         "clean:\n\trm -f $(OBJ) game\n")
     for name in ("ps2rt.h", "ps2rt.c"):
-        data = open(os.path.join(HERE, "runtime", name)).read()
-        open(os.path.join(a.outdir, name), "w").write(data)
+        write_if_changed(os.path.join(a.outdir, name),
+                         open(os.path.join(HERE, "runtime", name)).read())
 
     rep = [f"entry point      : 0x{elf.entry:08x}",
            f"functions        : {len(funcs)}",

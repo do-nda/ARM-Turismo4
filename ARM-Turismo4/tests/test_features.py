@@ -122,6 +122,20 @@ def features():
         a.raw(mmi(fn, sa, T2, 0, T0)); a.i(0x1F, A1, T2, 0)
         for i, v in enumerate(exp):
             a.lw(T3, 4 * i, A1); a.show(T3); want.append(s32(v))
+    # SA register: mtsab/mtsah/mtsa/mfsa + qfsrv (funnel shift of {rs:rt} right by SA bits)
+    a.la(A0, "qb"); a.i(0x1E, A0, T1, 0)
+    for kind, val, exp in ((0x18, 4, [B[1], B[2], B[3], A[0]]),    # mtsab 4  -> SA = 32
+                           (0x18, 8, [B[2], B[3], A[0], A[1]]),    # mtsab 8  -> SA = 64
+                           (0x19, 2, [B[1], B[2], B[3], A[0]]),    # mtsah 2  -> SA = 32
+                           (0x18, 0, B)):                          # SA = 0
+        a.i(0x01, Z, kind, val); a.raw(mmi(0x28, 0x1B, T2, T0, T1)); a.i(0x1F, A1, T2, 0)
+        for i, v in enumerate(exp):
+            a.lw(T3, 4 * i, A1); a.show(T3); want.append(s32(v))
+    a.i(0x01, Z, 0x18, 8); a.r(0x28, 0, 0, T3); a.show(T3); want.append(64)        # mfsa
+    a.addiu(T3, Z, 32); a.r(0x29, T3)                                              # mtsa
+    a.raw(mmi(0x28, 0x1B, T2, T0, T1)); a.i(0x1F, A1, T2, 0)
+    for i, v in enumerate([B[1], B[2], B[3], A[0]]):
+        a.lw(T3, 4 * i, A1); a.show(T3); want.append(s32(v))
     # madd / maddu (pipeline 0) and mult1 + madd1 (pipeline 1)
     a.addiu(T3, Z, 6); a.addiu(T1, Z, 7)
     a.r(0x18, T3, T1, T2); a.raw(mmi(0x00, 0, T0, T3, T1)); a.show(T0); want.append(84)
@@ -129,7 +143,14 @@ def features():
     a.raw(mmi(0x18, 0, T2, T3, T1)); a.raw(mmi(0x20, 0, T0, T3, T1)); a.show(T0); want.append(84)
     a.addiu(T3, Z, -3); a.raw(mmi(0x20, 0, T0, T3, T1)); a.show(T0); want.append(63)
     # syscall inventory: show() issues `addiu v1,zero,1; syscall`
-    a.addiu(V1, Z, 2); a.r(0x0C)
+    # guest kernel-mode handlers installed with SetSyscall (0x74), one returning via ERET
+    a.addiu(V1, Z, 0x74); a.addiu(A0, Z, 0x83); a.la(A1, "h1"); a.r(0x0C)
+    a.addiu(V1, Z, 0x83); a.addiu(A0, Z, 5); a.r(0x0C); a.show(V0); want.append(10)
+    a.addiu(V1, Z, 0x74); a.addiu(A0, Z, 0x5A); a.la(A1, "h2"); a.r(0x0C)
+    a.addiu(V1, Z, 0x5A); a.r(0x0C); a.show(V0); want.append(77)
+    a.addiu(V1, Z, 0x7001); a.r(0x0C)
+    a.label("h1"); a.addu(V0, A0, A0); a.r(0x08, RA); a.nop()
+    a.label("h2"); a.addiu(V0, Z, 77); a.raw(0x42000018)                    # eret
     while a.pc() % 16:
         a.nop()
     a.label("bytes"); a.w += [0x33221100, 0x77665544, 0xBBAA9988, 0xFFEEDDCC]
@@ -146,7 +167,7 @@ def scan_case():
     a.label("_start")
     a.la(T0, "table"); a.lw(T1, 0, T0); a.addiu(A0, Z, 6)
     a.r(0x09, T1, 0, RA); a.nop(); a.show(V0)
-    a.addiu(V1, Z, 2); a.r(0x0C); a.nop()
+    a.addiu(V1, Z, 0x7001); a.r(0x0C); a.nop()
     a.label("hidden"); a.addu(V0, A0, A0); a.r(0x08, RA); a.nop()
     a.label("table"); a.w.append(0)
     return a
@@ -158,7 +179,7 @@ def main():
     words = a.done()
     elf = os.path.join(tmp, "f.elf")
     T.write_elf(elf, words, a.labels["_start"])
-    rep, run = lift_build_run(tmp, elf)
+    rep, run = lift_build_run(tmp, elf, ["--add", hex(a.labels["h1"]), "--add", hex(a.labels["h2"])])
     assert run.returncode == 0, run.stderr
     got = [int(x) for x in run.stdout.split()]
     bad = [(i, g, w) for i, (g, w) in enumerate(zip(got, want)) if g != w]
@@ -168,10 +189,18 @@ def main():
     # (stray entries after the exit syscall are the data block being decoded as code)
     for name in ("LDL", "LDR", "SDL", "SDR", "COP0", "COP1", "MMI", "LWC1", "SWC1"):
         assert name not in rpt, f"{name} still unimplemented:\n{rpt}"
+    g = os.path.join(tmp, "out", "generated.c")
+    m0 = os.stat(g).st_mtime_ns
+    import time
+    time.sleep(0.05)
+    again = sh([sys.executable, os.path.join(ROOT, "r5900lift.py"), elf, "-o", os.path.join(tmp, "out"),
+                "--add", hex(a.labels["h1"]), "--add", hex(a.labels["h2"])])
+    assert again.returncode == 0 and os.stat(g).st_mtime_ns == m0, "unchanged output was rewritten"
+    print("features: re-lifting leaves unchanged files untouched (make skips them)")
     print("features: none of the new instruction classes are reported as unimplemented")
-    m = [l for l in rpt.splitlines() if "(0x1)" in l or "(0x2)" in l]
-    assert len(m) == 2 and "(0x1)" in m[0], f"syscall inventory wrong: {m}\n{rpt}"
-    print("features: BIOS syscall inventory lists syscalls 1 and 2")
+    m = [l for l in rpt.splitlines() if "(0x7000)" in l or "(0x7001)" in l]
+    assert len(m) == 2 and "(0x7000)" in m[0], f"syscall inventory wrong: {m}\n{rpt}"
+    print("features: BIOS syscall inventory lists syscalls 0x7000 and 0x7001")
     assert os.path.exists(os.path.join(tmp, "out", "Makefile"))
     mk = sh(["make", "-C", os.path.join(tmp, "out"), "-s", "clean", "game"])
     print("features: generated Makefile builds" if mk.returncode == 0 else

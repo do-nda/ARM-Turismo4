@@ -51,7 +51,7 @@ class Asm:
     def addu(self, rd, rs, rt): self.r(0x21, rs, rt, rd)
     def lw(self, rt, off, base): self.i(0x23, base, rt, off)
     def show(self, reg):
-        self.addu(A0, reg, Z); self.addiu(V1, Z, 1); self.r(0x0C)
+        self.addu(A0, reg, Z); self.addiu(V1, Z, 0x7000); self.r(0x0C)
 
     def done(self):
         for idx, lab, kind in self.fix:
@@ -100,7 +100,7 @@ def build():
     # 9. COP2 (VU0) word on a path that is analysed but never executed (must be reported)
     a.addiu(T0, Z, 1); a.br(0x05, T0, Z, "after"); a.nop(); a.raw(0x4A000000)
     a.label("after")
-    a.addiu(V1, Z, 2); a.r(0x0C)
+    a.addiu(V1, Z, 0x7001); a.r(0x0C)
     a.label("dbl"); a.r(0x08, RA); a.addu(V0, A0, A0)
     a.label("triple"); a.addu(T1, A0, A0); a.r(0x08, RA); a.addu(V0, T1, A0)
     while a.pc() % 16:
@@ -160,7 +160,7 @@ def main():
     print("run 2 output:", got)
     assert got == want, f"\nwant {want}\ngot  {got}"
     rep = open(os.path.join(out, "lift_report.txt")).read()
-    assert "COP2(VU0 macro)" in rep, rep
+    assert "COP2" in rep, rep
     print("PASS - all checks OK; lift report:\n" + rep)
 
 
