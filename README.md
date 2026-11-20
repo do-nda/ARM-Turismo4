@@ -14,7 +14,7 @@ with the long-term goal of running **Gran Turismo 4 natively on ARM devices (And
 - Everything derived from the disc stays on your machine: the extracted executables (`*.elf`, `CORE.*`),
   the generated C (`out*/`) and the run logs. The included `.gitignore` excludes them. **Never commit them.**
 - This project is independent and not affiliated with Sony, Polyphony Digital or any other rights holder.
-- Licence: not chosen yet. Add a `LICENSE` file before publishing.
+- Licence: AGPL-3.0 license.
 
 ## How it works
 
