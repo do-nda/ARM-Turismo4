@@ -1,5 +1,8 @@
 # ARM-Turismo4
 
+THIS VERSION HAS NOT BEEN UPDATED YET AND IS STILL THE PAL VERSION OF THE RECOMPILER
+The plan for this branch is that it will be rebuilt using *some* ported GT4Recomp code on Linux for Android.
+
 A static recompilation toolchain that turns PlayStation 2 (MIPS R5900) executables into portable C,
 with the long-term goal of running **Gran Turismo 4 natively on ARM devices (Android and Nintendo Switch)**.
 
@@ -97,7 +100,7 @@ a while, the guest call stack is printed). Environment variables: `PS2_LENIENT=1
 
 ## Status
 
-Measured on one European retail disc (boot executable `SCES_517.19`):
+Measured on one NTSC retail disc:
 
 - `CORE.GT4` unpacks cleanly (no encryption layer in the retail build), 3 sections, entry `0x00100008`,
   code in `0x100000`–`0x617a14`.
