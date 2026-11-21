@@ -19,7 +19,8 @@ typedef struct Ctx {
     u128 r[32];
     u64 hi[2], lo[2];
     u8 *ram;                                 /* PS2_RAM_SIZE bytes */
-    u8 spr[16384];                           /* scratchpad at 0x70000000 */
+    u8 *spr;                                 /* scratchpad at 0x70000000 (shared by all threads) */
+    void *kthread;                           /* runtime thread record (kernel layer) */
     u8 dummy[16];                            /* sink for unmapped/hardware access */
     u32 f[32];                               /* FPU registers (raw float bits) */
     u32 facc;                                /* FPU accumulator (raw float bits) */
@@ -53,7 +54,7 @@ static inline void ps2_break(Ctx *ctx, u32 pc) { ps2_unimpl(ctx, pc, 0x0Du); }
 static inline u8 *ps2_ptr(Ctx *ctx, u32 a) {
     u32 p = a & 0x1FFFFFFFu;
     if (p < PS2_RAM_SIZE) return ctx->ram + p;
-    if (a - 0x70000000u < sizeof(ctx->spr)) return ctx->spr + (a - 0x70000000u);
+    if (a - 0x70000000u < 16384u) return ctx->spr + (a - 0x70000000u);
     return ps2_hw_access(ctx, a);
 }
 

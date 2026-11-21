@@ -552,6 +552,14 @@ def scan_seeds(elf, entries):
     return a_set - entries, b_set - entries, c_set - entries
 
 
+def makefile_text():
+    return ("CC ?= cc\nCFLAGS ?= -O1 -w\nLDFLAGS ?= -rdynamic -pthread\n"
+            "SRC := $(wildcard generated*.c) func_table.c ps2rt.c\nOBJ := $(SRC:.c=.o)\n\n"
+            "game: $(OBJ)\n\t$(CC) $(LDFLAGS) -o $@ $(OBJ) -lm\n\n"
+            "%.o: %.c ps2rt.h\n\t$(CC) $(CFLAGS) -c $< -o $@\n\n"
+            "clean:\n\trm -f $(OBJ) game\n")
+
+
 def write_if_changed(path, text):
     try:
         if open(path).read() == text:
@@ -591,6 +599,8 @@ def main():
                     metavar=("SRC", "SIZE", "DEST"),
                     help="code the game copies around at runtime: lift SIZE bytes found at SRC "
                     "in the image as code located at DEST (repeatable)")
+    ap.add_argument("--blobs-file", metavar="FILE",
+                    help="file of 'SRC SIZE DEST' lines (written by the runtime as blobs.txt)")
     ap.add_argument("--split", type=int, default=0, metavar="N",
                     help="write N functions per generated_NNN.c file (use for big inputs)")
     a = ap.parse_args()
@@ -598,10 +608,16 @@ def main():
         for name in ("ps2rt.h", "ps2rt.c"):
             write_if_changed(os.path.join(a.sync_runtime, name),
                              open(os.path.join(HERE, "runtime", name)).read())
-        print(f"runtime files synced into {a.sync_runtime}")
+        write_if_changed(os.path.join(a.sync_runtime, "Makefile"), makefile_text())
+        print(f"runtime files and Makefile synced into {a.sync_runtime}")
         return
     if not a.elf:
         ap.error("the ELF argument is required")
+    if a.blobs_file and os.path.exists(a.blobs_file):
+        for line in open(a.blobs_file):
+            parts = line.split()
+            if len(parts) == 3 and parts not in a.blob:
+                a.blob.append(parts)
 
     elf = Elf(open(a.elf, "rb").read())
     if a.code_range:
@@ -681,12 +697,7 @@ def main():
             for e in sorted(funcs, key=lambda x: x & 0x1FFFFFFF)] + ["};"]
     for name, lines in (("generated.h", hdr), ("func_table.c", tbl)):
         write_if_changed(os.path.join(a.outdir, name), "\n".join(lines) + "\n")
-    write_if_changed(os.path.join(a.outdir, "Makefile"),
-        "CC ?= cc\nCFLAGS ?= -O1 -w\nLDFLAGS ?= -rdynamic\n"
-        "SRC := $(wildcard generated*.c) func_table.c ps2rt.c\nOBJ := $(SRC:.c=.o)\n\n"
-        "game: $(OBJ)\n\t$(CC) $(LDFLAGS) -o $@ $(OBJ) -lm\n\n"
-        "%.o: %.c ps2rt.h\n\t$(CC) $(CFLAGS) -c $< -o $@\n\n"
-        "clean:\n\trm -f $(OBJ) game\n")
+    write_if_changed(os.path.join(a.outdir, "Makefile"), makefile_text())
     for name in ("ps2rt.h", "ps2rt.c"):
         write_if_changed(os.path.join(a.outdir, name),
                          open(os.path.join(HERE, "runtime", name)).read())

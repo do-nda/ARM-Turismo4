@@ -124,10 +124,13 @@ def main():
     T.write_elf(elf4, b.done(), b.labels["_start"])
     _, _, run = build_and_run(tmp4, elf4, [])
     assert run.returncode == 3, "without --blob the copied code is unknown to the lifter"
+    assert "blobs.txt" in run.stderr, run.stderr
+    hint = open(os.path.join(tmp4, "blobs.txt")).read().split()
+    assert [int(x, 0) for x in hint] == [b.labels["blobsrc"], 32, 0x80076000], hint
     os.remove(os.path.join(tmp4, "missing_entries.txt"))
-    _, out, run = build_and_run(tmp4, elf4, ["--blob", hex(b.labels["blobsrc"]), "32", "0x80076000"])
+    _, out, run = build_and_run(tmp4, elf4, ["--blobs-file", os.path.join(tmp4, "blobs.txt")])
     assert run.returncode == 0 and run.stdout.split() == ["42"], run.stderr + run.stdout
-    print("blob: runtime-copied code lifted at its destination address and executed")
+    print("blob: the runtime found the copied code in the image; --blobs-file lifted and ran it")
 
     # find_code_range on clean code followed by random data
     rnd = random.Random(1)
