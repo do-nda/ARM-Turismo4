@@ -1,6 +1,6 @@
 # ARM-Turismo4
 
-THIS VERSION HAS NOT BEEN UPDATED YET AND IS STILL THE PAL VERSION OF THE RECOMPILER.
+# *THIS VERSION HAS NOT BEEN UPDATED YET AND IS STILL THE PAL VERSION OF THE RECOMPILER.*
 
 The plan for this branch is that it will be rebuilt using *some* ported GT4Recomp code on Linux for Android in order to speed up development time rather than building it from the ground up as I have been so far.
 
