@@ -1,10 +1,10 @@
-# ARM-Turismo4
+# ARM-Turismo4 (PS2Recomp version) 
 
 # *THIS VERSION HAS NOT BEEN UPDATED YET AND IS STILL THE PAL VERSION OF THE RECOMPILER.*
 
 This branch *will be* made with Gemini 4 Hydrogen (premium). 
 
-The plan for this branch is that it will be rebuilt using *some* ported GT4Recomp code on Linux for Android in order to speed up development time rather than building it from the ground up as I have been so far.
+The plan for this branch is that it will be integrated with *some* ported GT4Recomp code on Linux for Android in order to speed up development time rather than building it from the ground up as I have been so far.
 
 A static recompilation toolchain that turns PlayStation 2 (MIPS R5900) executables into portable C,
 with the long-term goal of running **Gran Turismo 4 natively on ARM devices (Android and Nintendo Switch)**.
