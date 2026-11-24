@@ -2,6 +2,8 @@
 
 # *THIS VERSION HAS NOT BEEN UPDATED YET AND IS STILL THE PAL VERSION OF THE RECOMPILER.*
 
+This branch *will be* made with Gemini 4 Hydrogen (premium). 
+
 The plan for this branch is that it will be rebuilt using *some* ported GT4Recomp code on Linux for Android in order to speed up development time rather than building it from the ground up as I have been so far.
 
 A static recompilation toolchain that turns PlayStation 2 (MIPS R5900) executables into portable C,
