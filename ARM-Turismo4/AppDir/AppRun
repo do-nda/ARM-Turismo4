@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(dirname "$(readlink -f "${0}")")"
+export APPDIR="${HERE}"
+export PATH="${HERE}/usr/bin:${PATH}"
+export QT_AUTO_SCREEN_SCALE_FACTOR=1
+exec "${HERE}/usr/bin/gt4-recomp-gui" "$@"
