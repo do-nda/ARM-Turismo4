@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ARM-Turismo4 Recompiler
+Comment=Static PS2 R5900 to Android ARM64 Recompiler GUI
+Exec=gt4-recomp-gui
+Icon=arm-turismo4
+Categories=Development;Emulator;
+Terminal=false

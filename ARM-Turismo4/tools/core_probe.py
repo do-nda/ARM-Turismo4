@@ -1,156 +1,117 @@
 #!/usr/bin/env python3
-"""core_probe.py - inspect and unpack a Gran Turismo CORE.* executable from your own disc.
-
-Layer order follows the community docs (nenkai.github.io/gt-modding-hub, "CORE - PS2
-Executables"): [optional encryption] -> compression -> main header + sections.
-The docs are loose on details, so this tool TESTS each assumption against the real file
-and reports what matched, instead of assuming. Send the printed report if it fails.
-
-    python3 core_probe.py CORE.GT4                        # analyse only
-    python3 core_probe.py CORE.GT4 --emit-elf core.elf    # build an ELF for r5900lift.py
-    python3 core_probe.py CORE.GT4 --dump core.dec        # keep the decompressed bytes
-"""
+"""core_probe.py - inspect and unpack a GT4 CORE.GT4 container into an R5900 ELF."""
 import argparse
-import math
 import struct
 import sys
 import zlib
-from collections import Counter
 
-PS2ZIP = b"\xff\xf7\xee\xc5"
-
-
-def entropy(b):
-    if not b:
-        return 0.0
-    n = len(b)
-    return -sum(c / n * math.log2(c / n) for c in Counter(b).values())
+PS2ZIP_MAGIC = b"\xff\xf7\xee\xc5"
 
 
-def inflate(data, off):
-    """Try raw deflate then zlib at `off`. Returns (method, bytes, complete) or None."""
-    best = None
-    for name, wbits in (("raw deflate", -15), ("zlib", 15)):
-        try:
-            d = zlib.decompressobj(wbits)
-            out = d.decompress(data[off:])
-        except zlib.error:
-            continue
-        if len(out) >= 64 and (d.eof or best is None):
-            best = (name, out, d.eof)
-            if d.eof:
-                break
-    return best
-
-
-def candidates(data):
-    c = []
-    if data[:4] == PS2ZIP:
-        c.append(("PS2ZIP at offset 0", 8, -struct.unpack_from("<i", data, 4)[0]))
-    if data[6:10] == PS2ZIP:
-        c.append(("6-byte layer header + PS2ZIP", 14, -struct.unpack_from("<i", data, 10)[0]))
-    if len(data) > 6:
-        c.append(("6-byte layer header (u16 flags, u32 size) + deflate", 6,
-                  struct.unpack_from("<I", data, 2)[0]))
-    c.append(("bare deflate at offset 0", 0, None))
-    return c
-
-
-def parse_main(buf):
-    """Main header per docs: [u16 n][hash n bytes] x2, i32 section count, i32 entry,
-    then sections of (i32 target, i32 size, data). Returns dict or None."""
+def unpack_core(blob):
+    if len(blob) < 16:
+        return None, "file too small"
+    ver, uncomp_size = struct.unpack_from("<HI", blob, 0)
+    if ver not in (1, 2) or uncomp_size == 0 or uncomp_size > 64 * 1024 * 1024:
+        return None, f"unrecognized outer header (ver={ver}, size={uncomp_size})"
+    if blob[6:10] == PS2ZIP_MAGIC:
+        if len(blob) < 14:
+            return None, "truncated PS2ZIP header"
+        neg_size = struct.unpack_from("<i", blob, 10)[0]
+        if neg_size >= 0 or -neg_size > 64 * 1024 * 1024:
+            return None, f"invalid PS2ZIP size ({neg_size})"
+        kind, comp = "PS2ZIP", blob[14:]
+    else:
+        kind, comp = "raw-deflate", blob[6:]
     try:
-        p = 0
-        for _ in range(2):
-            n = struct.unpack_from("<H", buf, p)[0]
-            p += 2 + n
-        count, entry = struct.unpack_from("<ii", buf, p)
-        p += 8
-        secs = []
-        for _ in range(count):
-            tgt, size = struct.unpack_from("<ii", buf, p)
-            p += 8
-            if size < 0 or p + size > len(buf):
-                return None
-            secs.append((tgt & 0xFFFFFFFF, size, p))
-            p += size
-    except struct.error:
-        return None
-    ok = 0 < count < 256 and p == len(buf) and all(s[1] > 0 for s in secs)
-    return dict(entry=entry & 0xFFFFFFFF, sections=secs, consumed=p, ok=ok)
+        raw = zlib.decompress(comp, -15)
+    except zlib.error as e:
+        return None, f"DEFLATE error: {e}"
+    if len(raw) != uncomp_size:
+        return None, f"size mismatch: header={uncomp_size}, inflated={len(raw)}"
+    return (kind, raw), None
 
 
-def build_elf(buf, main):
-    secs = main["sections"]
-    off = 52 + 32 * len(secs)
-    hdr = b"\x7fELF" + bytes([1, 1, 1, 0]) + bytes(8)
-    hdr += struct.pack("<HHIIIIIHHHHHH", 2, 8, 1, main["entry"], 52, 0, 0, 52, 32,
-                       len(secs), 0, 0, 0)
-    ph, body = b"", b""
-    for tgt, size, src in secs:
-        # only the section holding the entry point is executable; the rest is data
-        flags = 7 if tgt <= main["entry"] < tgt + size else 6
-        ph += struct.pack("<8I", 1, off + len(body), tgt, tgt, size, size, flags, 16)
-        body += buf[src:src + size]
-    return hdr + ph + body
+def parse_sections(raw):
+    pos = 0
+    if pos + 2 > len(raw):
+        return None, "truncated header 1"
+    pos += 2 + struct.unpack_from("<H", raw, pos)[0]
+    if pos + 2 > len(raw):
+        return None, "truncated header 2"
+    pos += 2 + struct.unpack_from("<H", raw, pos)[0]
+    if pos + 8 > len(raw):
+        return None, "truncated section directory"
+    nsec, entry = struct.unpack_from("<iI", raw, pos)
+    pos += 8
+    if nsec <= 0 or nsec > 64 or entry == 0:
+        return None, f"invalid section count ({nsec}) or entry (0x{entry:08x})"
+    sections = []
+    for i in range(nsec):
+        if pos + 8 > len(raw):
+            return None, f"truncated section {i} header"
+        vaddr, sz = struct.unpack_from("<II", raw, pos)
+        pos += 8
+        if sz == 0 or pos + sz > len(raw):
+            return None, f"invalid section {i} payload"
+        sections.append((vaddr, raw[pos:pos + sz]))
+        pos += sz
+    if pos != len(raw) and any(b != 0 for b in raw[pos:]):
+        return None, f"unexpected trailing bytes ({len(raw) - pos})"
+    return (entry, sections), None
+
+
+def emit_elf(path, entry, sections):
+    ehdr_size, phdr_size, phnum = 52, 32, len(sections)
+    ehdr = b"\x7fELF" + bytes([1, 1, 1, 0]) + bytes(8)
+    ehdr += struct.pack(
+        "<HHIIIIIHHHHHH",
+        2, 8, 1, entry, ehdr_size, 0, 0x20924001,
+        ehdr_size, phdr_size, phnum, 0, 0, 0,
+    )
+    offset = (ehdr_size + phnum * phdr_size + 15) & ~15
+    phdrs = bytearray()
+    payload = bytearray(offset - (ehdr_size + phnum * phdr_size))
+    for vaddr, data in sections:
+        phdrs += struct.pack(
+            "<8I", 1, offset, vaddr, vaddr & 0x1FFFFFFF, len(data), len(data), 7, 16
+        )
+        payload += data
+        offset += len(data)
+        pad = (-offset) & 15
+        if pad:
+            payload += bytes(pad)
+            offset += pad
+    with open(path, "wb") as f:
+        f.write(ehdr + phdrs + payload)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("core")
-    ap.add_argument("--dump", help="write the decompressed layer to this file")
-    ap.add_argument("--emit-elf", help="write a synthetic ELF built from the sections")
+    ap.add_argument("--emit-elf", help="write reconstructed 32-bit MIPS ELF")
     a = ap.parse_args()
 
-    data = open(a.core, "rb").read()
-    print(f"file            : {a.core} ({len(data)} bytes)")
-    print(f"first 32 bytes  : {data[:32].hex(' ')}")
-    print(f"last 8 bytes    : {data[-8:].hex(' ')}")
-    print(f"entropy (64 KB) : {entropy(data[:65536]):.2f} bits/byte "
-          "(near 8 = compressed or encrypted)")
-
-    buf = None
-    for label, off, declared in candidates(data):
-        r = inflate(data, off)
-        if not r:
-            print(f"[ ] {label}: inflate failed")
-            continue
-        method, out, complete = r
-        match = "n/a" if declared is None else ("yes" if declared == len(out) else
-                                                  f"NO (declared {declared})")
-        print(f"[x] {label}: {method}, {len(out)} bytes, stream complete={complete}, "
-              f"size matches header={match}")
-        if complete:
-            buf = out
-            break
-    if buf is None:
-        print("\nNo compression layer matched. The file may be ENCRYPTED (the docs describe "
-              "an encryption layer for the GT4 Online build) or use another layout.\n"
-              "Please send the report above.")
+    unpacked, err = unpack_core(open(a.core, "rb").read())
+    if err:
+        print(f"status          : ENCRYPTED or unrecognized container ({err})")
         sys.exit(2)
-    if a.dump:
-        open(a.dump, "wb").write(buf)
-        print(f"decompressed layer written to {a.dump}")
-
-    print(f"\ndecompressed head: {buf[:48].hex(' ')}")
-    main_hdr = parse_main(buf)
-    if not main_hdr:
-        print("Main header did not parse with the documented layout. Send the report above.")
-        sys.exit(3)
-    print(f"entry point     : 0x{main_hdr['entry']:08x}")
-    print(f"sections        : {len(main_hdr['sections'])}")
-    inside = False
-    for tgt, size, src in main_hdr["sections"]:
-        print(f"  target 0x{tgt:08x}  size {size:9d}  (file offset 0x{src:x})")
-        inside |= tgt <= main_hdr["entry"] < tgt + size
-    print(f"layout check    : {'consistent' if main_hdr['ok'] else 'INCONSISTENT'}; "
-          f"entry inside a section: {inside}")
+    kind, raw = unpacked
+    parsed, err = parse_sections(raw)
+    if err:
+        print(f"status          : ENCRYPTED or malformed layout ({err})")
+        sys.exit(2)
+    entry, sections = parsed
+    print(f"container       : {kind}")
+    print(f"uncompressed    : {len(raw)} bytes")
+    print(f"entry point     : 0x{entry:08x}")
+    print(f"sections        : {len(sections)}")
+    for i, (vaddr, data) in enumerate(sections):
+        print(f"  [{i}] vaddr=0x{vaddr:08x} size=0x{len(data):x}")
+    print("layout check    : consistent")
     if a.emit_elf:
-        if not (main_hdr["ok"] and inside):
-            print("not writing ELF: layout looks wrong")
-            sys.exit(3)
-        open(a.emit_elf, "wb").write(build_elf(buf, main_hdr))
-        print(f"ELF written to  : {a.emit_elf}  (next: python3 r5900lift.py {a.emit_elf} -o out_core)")
+        emit_elf(a.emit_elf, entry, sections)
+        print(f"written ELF     : {a.emit_elf}")
 
 
 if __name__ == "__main__":

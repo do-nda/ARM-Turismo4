@@ -1,0 +1,72 @@
+('/home/ironlaptop/Documents/Gemini '
+ 'ARM-Turismo4/build/gt4-recomp-gui/gt4-recomp-gui',
+ False,
+ False,
+ True,
+ None,
+ None,
+ False,
+ False,
+ None,
+ True,
+ False,
+ None,
+ None,
+ None,
+ '/home/ironlaptop/Documents/Gemini '
+ 'ARM-Turismo4/build/gt4-recomp-gui/gt4-recomp-gui.pkg',
+ [('pyi-contents-directory _internal', '', 'OPTION'),
+  ('PYZ-00.pyz',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/build/gt4-recomp-gui/PYZ-00.pyz',
+   'PYZ'),
+  ('python3.14/lib-dynload/_struct.cpython-314-x86_64-linux-gnu.so',
+   '/usr/lib64/python3.14/lib-dynload/_struct.cpython-314-x86_64-linux-gnu.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/zlib.cpython-314-x86_64-linux-gnu.so',
+   '/usr/lib64/python3.14/lib-dynload/zlib.cpython-314-x86_64-linux-gnu.so',
+   'EXTENSION'),
+  ('struct',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/build/gt4-recomp-gui/localpycs/struct.pyc',
+   'PYMODULE'),
+  ('pyimod01_archive',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/build/gt4-recomp-gui/localpycs/pyimod01_archive.pyc',
+   'PYMODULE'),
+  ('pyimod02_importers',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/build/gt4-recomp-gui/localpycs/pyimod02_importers.pyc',
+   'PYMODULE'),
+  ('pyimod03_ctypes',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/build/gt4-recomp-gui/localpycs/pyimod03_ctypes.pyc',
+   'PYMODULE'),
+  ('pyiboot01_bootstrap',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/.venv-appimage/lib64/python3.14/site-packages/PyInstaller/loader/pyiboot01_bootstrap.py',
+   'PYSOURCE'),
+  ('pyi_rth_inspect',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/.venv-appimage/lib/python3.14/site-packages/PyInstaller/hooks/rthooks/pyi_rth_inspect.py',
+   'PYSOURCE'),
+  ('pyi_rth_pyside6',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/.venv-appimage/lib/python3.14/site-packages/PyInstaller/hooks/rthooks/pyi_rth_pyside6.py',
+   'PYSOURCE'),
+  ('pyi_rth_pkgutil',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/.venv-appimage/lib/python3.14/site-packages/PyInstaller/hooks/rthooks/pyi_rth_pkgutil.py',
+   'PYSOURCE'),
+  ('gt4_recomp_gui',
+   '/home/ironlaptop/Documents/Gemini ARM-Turismo4/gt4_recomp_gui.py',
+   'PYSOURCE')],
+ [],
+ False,
+ False,
+ 1795788728,
+ [('run',
+   '/home/ironlaptop/Documents/Gemini '
+   'ARM-Turismo4/.venv-appimage/lib64/python3.14/site-packages/PyInstaller/bootloader/Linux-64bit-intel/run',
+   'EXECUTABLE')],
+ '/lib64/libpython3.14.so.1.0')

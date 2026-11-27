@@ -264,4 +264,10 @@ static inline void ps2_plzcw(u128 *d, const u128 *s) {
     memcpy(d, &r, 16);
 }
 
+
+/* VU0 macro-mode helpers (emitted when r5900lift.py runs with --vu0-macro) */
+void ps2_vu0_lqc2(Ctx *ctx, u32 rt, u32 addr);
+void ps2_vu0_sqc2(Ctx *ctx, u32 rt, u32 addr);
+void ps2_vu0_macro(Ctx *ctx, u32 word);
+
 #endif
