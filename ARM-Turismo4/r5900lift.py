@@ -1,725 +1,747 @@
+import re
 #!/usr/bin/env python3
-"""r5900lift - prototype static recompiler: PS2 (MIPS R5900) ELF -> portable C.
-
-Input : an ELF you dumped from your own disc (nothing game-specific is bundled).
-Output: generated.c/.h, func_table.c, ps2rt.h/.c (runtime) and lift_report.txt.
-The generated C is plain C99 (stdint/string only), so the same output builds
-with the Android NDK (arm64-v8a), devkitA64 (Switch) or any desktop compiler.
-
-Pipeline: load ELF -> discover functions (recursive descent) -> lift each
-instruction to C -> emit. Anything not yet lifted becomes ps2_unimpl() and is
-listed in lift_report.txt. Indirect jumps go through ps2_dispatch(); targets
-the runtime cannot resolve are logged to missing_entries.txt, which you feed
-back with --entries (the "discover missing functions" loop).
-"""
+"""r5900lift.py - static MIPS R5900 (PS2 Emotion Engine) -> portable C99 recompiler."""
 import argparse
-import collections
+import sys
 import os
 import struct
-import sys
+from collections import deque
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def sx16(v):
-    return v - 0x10000 if v & 0x8000 else v
-
-
-def sx32(v):
-    v &= 0xFFFFFFFF
-    return v - (1 << 32) if v & 0x80000000 else v
-
-
-def M(n):  # register read
-    return "0" if n == 0 else f"G({n})"
-
-
-def W(n, e):  # register write (writes to $zero vanish)
-    return "" if n == 0 else f"G({n}) = {e};"
-
-
-class Elf:
-    def __init__(self, data):
-        if data[:4] != b"\x7fELF" or data[4] != 1 or data[5] != 1:
-            sys.exit("error: expected a 32-bit little-endian ELF")
-        (_, machine, _, self.entry, phoff, _, _, _, phentsize,
-         phnum) = struct.unpack_from("<HHIIIIIHHH", data, 16)
-        if machine != 8:
-            sys.exit("error: not a MIPS ELF (e_machine != 8)")
-        segs = []
-        for i in range(phnum):
-            t, off, va, _pa, fsz, _msz, fl, _al = struct.unpack_from(
-                "<8I", data, phoff + i * phentsize)
-            if t == 1:
-                segs.append((va, off, fsz, fl))
-        exe = [s for s in segs if s[3] & 1] or segs
-
-        def words(va, off, fsz):
-            n = fsz // 4
-            vals = struct.unpack_from(f"<{n}I", data, off)
-            return {va + 4 * i: v for i, v in enumerate(vals)}
-
-        self.code, self.data = {}, {}
-        for va, off, fsz, _ in exe:
-            self.code.update(words(va, off, fsz))
-        for va, off, fsz, _ in segs:
-            self.data.update(words(va, off, fsz))
-
-
-class Stats:
-    def __init__(self):
-        self.total = 0
-        self.ok = 0
-        self.unimpl = collections.OrderedDict()  # name -> [count, first_pc]
-        self.indirect = []
-        self.sys = {}  # BIOS syscall number (or None) -> [sites, first pc]
-
-    def bad(self, name, pc):
-        e = self.unimpl.setdefault(name, [0, pc])
-        e[0] += 1
-
-
-def describe(w):
-    op = w >> 26
-    if op == 0:
-        return f"SPECIAL funct=0x{w & 63:02x}"
-    if op == 1:
-        return f"REGIMM rt=0x{(w >> 16) & 31:02x}"
-    rs = (w >> 21) & 31
-    if op in (0x10, 0x12) and rs >= 0x10:  # coprocessor "CO" instructions: funct selects the op
-        extra = f" bits10_6=0x{(w >> 6) & 31:02x}" if (w & 63) >= 0x3C else ""
-        return f"{'COP0' if op == 0x10 else 'COP2 (VU0 macro)'} CO funct=0x{w & 63:02x}{extra}"
-    cop = {0x10: "COP0", 0x11: "COP1(FPU)", 0x12: "COP2(VU0 macro)"}
-    if op in cop:
-        return f"{cop[op]} rs/fmt=0x{rs:02x}"
-    if op == 0x1C:
-        fn = w & 63
-        if fn in (0x08, 0x09, 0x28, 0x29):
-            return f"MMI funct=0x{fn:02x} sa=0x{(w >> 6) & 31:02x}"
-        return f"MMI funct=0x{fn:02x}"
-    names = {0x1A: "LDL", 0x1B: "LDR", 0x2C: "SDL", 0x2D: "SDR", 0x31: "LWC1",
-             0x39: "SWC1", 0x36: "LQC2", 0x3E: "SQC2"}
-    return names.get(op, f"opcode 0x{op:02x}")
-
-
-# ---------------------------------------------------------------- lifting
-SP_D = {  # SPECIAL ops of the form rd = expr
-    0x00: "SX32((u32){RT} << {sh})", 0x02: "SX32((u32){RT} >> {sh})",
-    0x03: "SX32((s32){RT} >> {sh})",
-    0x04: "SX32((u32){RT} << ({RS} & 31))",
-    0x06: "SX32((u32){RT} >> ({RS} & 31))",
-    0x07: "SX32((s32){RT} >> ({RS} & 31))",
-    0x10: "HI", 0x12: "LO",
-    0x14: "{RT} << ({RS} & 63)", 0x16: "{RT} >> ({RS} & 63)",
-    0x17: "(u64)((s64){RT} >> ({RS} & 63))",
-    0x20: "SX32({RS} + {RT})", 0x21: "SX32({RS} + {RT})",
-    0x22: "SX32({RS} - {RT})", 0x23: "SX32({RS} - {RT})",
-    0x24: "{RS} & {RT}", 0x25: "{RS} | {RT}", 0x26: "{RS} ^ {RT}",
-    0x27: "~({RS} | {RT})",
-    0x2A: "(u64)((s64){RS} < (s64){RT})", 0x2B: "(u64)({RS} < {RT})",
-    0x2C: "{RS} + {RT}", 0x2D: "{RS} + {RT}",
-    0x2E: "{RS} - {RT}", 0x2F: "{RS} - {RT}",
-    0x38: "{RT} << {sh}", 0x3A: "{RT} >> {sh}",
-    0x3B: "(u64)((s64){RT} >> {sh})",
-    0x3C: "{RT} << {sh32}", 0x3E: "{RT} >> {sh32}",
-    0x3F: "(u64)((s64){RT} >> {sh32})",
-}
-IMM_D = {  # I-type ops of the form rt = expr
-    0x08: "SX32({RS} + {I})", 0x09: "SX32({RS} + {I})",
-    0x18: "{RS} + {I}", 0x19: "{RS} + {I}",
-    0x0A: "(u64)((s64){RS} < {simm}LL)", 0x0B: "(u64)({RS} < {I})",
-    0x0C: "{RS} & {imm}u", 0x0D: "{RS} | {imm}u", 0x0E: "{RS} ^ {imm}u",
-    0x20: "(u64)(s64)(s8)ps2_rd8(ctx, {A})", 0x24: "(u64)ps2_rd8(ctx, {A})",
-    0x21: "(u64)(s64)(s16)ps2_rd16(ctx, {A})",
-    0x25: "(u64)ps2_rd16(ctx, {A})",
-    0x23: "SX32(ps2_rd32(ctx, {A}))", 0x27: "(u64)ps2_rd32(ctx, {A})",
-    0x37: "ps2_rd64(ctx, {A})",
-    0x1A: "ps2_ldl(ctx, {A}, {RT})", 0x1B: "ps2_ldr(ctx, {A}, {RT})",
-    0x22: "SX32(ps2_lwl(ctx, {A}, (u32){RT}))",
-    0x26: "SX32(ps2_lwr(ctx, {A}, (u32){RT}))",
-}
-ST = {
-    0x28: "ps2_wr8(ctx, {A}, (u8){RT});", 0x29: "ps2_wr16(ctx, {A}, (u16){RT});",
-    0x2B: "ps2_wr32(ctx, {A}, (u32){RT});", 0x3F: "ps2_wr64(ctx, {A}, {RT});",
-    0x2C: "ps2_sdl(ctx, {A}, {RT});", 0x2D: "ps2_sdr(ctx, {A}, {RT});",
-    0x2A: "ps2_swl(ctx, {A}, (u32){RT});", 0x2E: "ps2_swr(ctx, {A}, (u32){RT});",
-}
-
-
-MMI_TAB = {  # (funct, sa) -> helper name. Encodings from the R5900 manual, from memory:
-    # verify against a reference before trusting.
-    (0x08, 0x00): "paddw", (0x08, 0x01): "psubw", (0x08, 0x02): "pcgtw",
-    (0x08, 0x03): "pmaxw", (0x08, 0x04): "paddh", (0x08, 0x05): "psubh",
-    (0x08, 0x06): "pcgth", (0x08, 0x07): "pmaxh", (0x08, 0x08): "paddb",
-    (0x08, 0x09): "psubb", (0x08, 0x0A): "pcgtb",
-    (0x08, 0x10): "paddsw", (0x08, 0x11): "psubsw", (0x08, 0x12): "pextlw",
-    (0x08, 0x13): "ppacw", (0x08, 0x14): "paddsh", (0x08, 0x15): "psubsh",
-    (0x08, 0x16): "pextlh", (0x08, 0x17): "ppach", (0x08, 0x18): "paddsb",
-    (0x08, 0x19): "psubsb", (0x08, 0x1A): "pextlb", (0x08, 0x1B): "ppacb",
-    (0x28, 0x01): "pabsw", (0x28, 0x02): "pceqw", (0x28, 0x03): "pminw",
-    (0x28, 0x05): "pabsh", (0x28, 0x06): "pceqh", (0x28, 0x07): "pminh",
-    (0x28, 0x0A): "pceqb", (0x28, 0x10): "padduw", (0x28, 0x11): "psubuw",
-    (0x28, 0x12): "pextuw", (0x28, 0x14): "padduh", (0x28, 0x15): "psubuh",
-    (0x28, 0x16): "pextuh", (0x28, 0x18): "paddub", (0x28, 0x19): "psubub",
-    (0x28, 0x1A): "pextub",
-    (0x09, 0x0E): "pcpyld", (0x09, 0x12): "pand", (0x09, 0x13): "pxor",
-    (0x29, 0x0E): "pcpyud", (0x29, 0x12): "por", (0x29, 0x13): "pnor",
-    (0x29, 0x1B): "pcpyh",
-}
-
-
-MMI_SHIFT = {0x34: "psllh", 0x36: "psrlh", 0x37: "psrah",
-             0x3C: "psllw", 0x3E: "psrlw", 0x3F: "psraw"}
-
-
-def mmi(w):
-    rs, rt, rd = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
-    sa, fn = (w >> 6) & 31, w & 63
-    RS, RT = M(rs), M(rt)
-    d, s_, t = f"&ctx->r[{rd}]", f"&ctx->r[{rs}]", f"&ctx->r[{rt}]"
-    if fn == 0x04:
-        return "" if rd == 0 else f"ps2_plzcw({d}, {s_});"
-    if fn == 0x10:
-        return W(rd, "ctx->hi[1]")
-    if fn == 0x11:
-        return f"ctx->hi[1] = {RS};"
-    if fn == 0x12:
-        return W(rd, "ctx->lo[1]")
-    if fn == 0x13:
-        return f"ctx->lo[1] = {RS};"
-    if fn in (0x18, 0x19):
-        sg = "s" if fn == 0x18 else "u"
-        return (f"{{ {sg}64 p = ({sg}64)({sg}32){RS} * ({sg}64)({sg}32){RT}; "
-                f"ctx->lo[1] = SX32(p); ctx->hi[1] = SX32(p >> 32); "
-                f"{W(rd, 'ctx->lo[1]')} }}")
-    if fn in MMI_SHIFT:
-        return "" if rd == 0 else f"ps2_{MMI_SHIFT[fn]}({d}, {t}, {sa});"
-    if fn in (0x00, 0x01, 0x20, 0x21):  # madd / maddu, pipeline 0 or 1 (3-operand form)
-        k = 1 if fn & 0x20 else 0
-        sg = "s" if fn in (0x00, 0x20) else "u"
-        return (f"{{ u64 acc = ((u64)(u32)ctx->hi[{k}] << 32) | (u32)ctx->lo[{k}]; "
-                f"acc += ({sg}64)({sg}32){RS} * ({sg}64)({sg}32){RT}; "
-                f"ctx->lo[{k}] = SX32(acc); ctx->hi[{k}] = SX32(acc >> 32); "
-                f"{W(rd, f'ctx->lo[{k}]')} }}")
-    if fn == 0x1A:
-        return f"ps2_div1(ctx, {RS}, {RT});"
-    if fn == 0x1B:
-        return f"ps2_divu1(ctx, {RS}, {RT});"
-    if (fn, sa) == (0x28, 0x1B):  # qfsrv: funnel shift right by SA
-        return "" if rd == 0 else f"ps2_qfsrv({d}, {s_}, {t}, ctx->sa);"
-    name = MMI_TAB.get((fn, sa))
-    if name:
-        return "" if rd == 0 else f"ps2_{name}({d}, {s_}, {t});"
-    return None
-
-
-def cop0(w):
-    rs, rt, rd, fn = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31, w & 63
-    if rs == 0:
-        return W(rt, f"SX32(ps2_cop0_read(ctx, {rd}))")
-    if rs == 4:
-        return f"ps2_cop0_write(ctx, {rd}, (u32){M(rt)});"
-    if rs == 0x10 and fn in (0x38, 0x39):
-        return "ps2_cop0_ei(ctx);" if fn == 0x38 else "ps2_cop0_di(ctx);"
-    return None
-
-
-def cop1(w):
-    fmt, ft, fs = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
-    fd, fn = (w >> 6) & 31, w & 63
-    if fmt == 0x00:
-        return W(ft, f"SX32(F({fs}))")                      # mfc1
-    if fmt == 0x02:
-        return W(ft, f"SX32(ps2_cfc1(ctx, {fs}))")          # cfc1
-    if fmt == 0x04:
-        return f"F({fs}) = (u32){M(ft)};"                   # mtc1
-    if fmt == 0x06:
-        return f"ps2_ctc1(ctx, {fs}, (u32){M(ft)});"        # ctc1
-    if fmt == 0x14 and fn == 0x20:
-        return f"F({fd}) = ps2_fix((float)(s32)F({fs}));"   # cvt.s.w
-    if fmt != 0x10:
-        return None
-    a, b, acc = f"ps2_f(F({fs}))", f"ps2_f(F({ft}))", "ps2_f(ctx->facc)"
-    t = {
-        0x00: f"F({fd}) = ps2_fix({a} + {b});", 0x01: f"F({fd}) = ps2_fix({a} - {b});",
-        0x02: f"F({fd}) = ps2_fix({a} * {b});", 0x03: f"F({fd}) = ps2_fix({a} / {b});",
-        0x04: f"F({fd}) = ps2_fix(sqrtf(fabsf({b})));",
-        0x05: f"F({fd}) = F({fs}) & 0x7FFFFFFFu;", 0x06: f"F({fd}) = F({fs});",
-        0x07: f"F({fd}) = F({fs}) ^ 0x80000000u;",
-        0x16: f"F({fd}) = ps2_fix({a} / sqrtf(fabsf({b})));",
-        0x18: f"ctx->facc = ps2_fix({a} + {b});", 0x19: f"ctx->facc = ps2_fix({a} - {b});",
-        0x1A: f"ctx->facc = ps2_fix({a} * {b});",
-        0x1C: f"F({fd}) = ps2_fix({acc} + {a} * {b});",
-        0x1D: f"F({fd}) = ps2_fix({acc} - {a} * {b});",
-        0x1E: f"ctx->facc = ps2_fix({acc} + {a} * {b});",
-        0x1F: f"ctx->facc = ps2_fix({acc} - {a} * {b});",
-        0x24: f"F({fd}) = ps2_cvtws({a});",
-        0x28: f"F({fd}) = ps2_fix({a} > {b} ? {a} : {b});",
-        0x29: f"F({fd}) = ps2_fix({a} < {b} ? {a} : {b});",
-        0x30: "ps2_fc(ctx, 0);", 0x32: f"ps2_fc(ctx, {a} == {b});",
-        0x34: f"ps2_fc(ctx, {a} < {b});", 0x36: f"ps2_fc(ctx, {a} <= {b});",
-    }
-    return t.get(fn)
-
-
-def simple(w, pc):
-    """Lift a non-control-flow instruction. Returns C text, or None if unsupported."""
-    op = w >> 26
-    rs, rt, rd = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
-    sh, fn, imm = (w >> 6) & 31, w & 63, w & 0xFFFF
-    simm = sx16(imm)
-    f = dict(RS=M(rs), RT=M(rt), sh=sh, sh32=sh + 32, imm=imm, simm=simm,
-             I=f"(u64)({simm}LL)")
-    f["A"] = f"(u32)({f['RS']} + {f['I']})"
-    RS, RT = f["RS"], f["RT"]
-    if op == 0:
-        if fn in SP_D:
-            return W(rd, SP_D[fn].format(**f))
-        if fn in (0x0A, 0x0B):  # movz / movn
-            cmp_ = "==" if fn == 0x0A else "!="
-            return "" if rd == 0 else f"if ({RT} {cmp_} 0) G({rd}) = {RS};"
-        if fn == 0x0C:
-            return f"ps2_syscall(ctx, 0x{pc:08x}u);"
-        if fn == 0x0D:
-            return f"ps2_break(ctx, 0x{pc:08x}u);"  # compilers emit this after div (trap)
-        if fn == 0x0F:
-            return ""  # sync
-        if fn == 0x28:  # mfsa
-            return W(rd, "(u64)ctx->sa")
-        if fn == 0x29:  # mtsa
-            return f"ctx->sa = (u32){RS} & 0x7Fu;"
-        if fn == 0x11:
-            return f"HI = {RS};"
-        if fn == 0x13:
-            return f"LO = {RS};"
-        if fn in (0x18, 0x19):  # R5900 mult/multu also write rd
-            sg = "s" if fn == 0x18 else "u"
-            return (f"{{ {sg}64 p = ({sg}64)({sg}32){RS} * ({sg}64)({sg}32){RT}; "
-                    f"LO = SX32(p); HI = SX32(p >> 32); {W(rd, 'LO')} }}")
-        if fn == 0x1A:
-            return f"ps2_div(ctx, {RS}, {RT});"
-        if fn == 0x1B:
-            return f"ps2_divu(ctx, {RS}, {RT});"
-        return None
-    if op == 1 and rt == 0x18:  # mtsab: SA (in bits) = byte count
-        return f"ctx->sa = (((u32){RS} & 0xFu) ^ {imm & 0xF}u) << 3;"
-    if op == 1 and rt == 0x19:  # mtsah: SA (in bits) = halfword count
-        return f"ctx->sa = (((u32){RS} & 0x7u) ^ {imm & 0x7}u) << 4;"
-    if op == 0x0F:  # lui, constant folded
-        return W(rt, f"0x{(sx32(imm << 16)) & (2**64 - 1):x}ull")
-    if op in IMM_D:
-        return W(rt, IMM_D[op].format(**f))
-    if op in ST:
-        return ST[op].format(**f)
-    if op == 0x1E:  # lq
-        return "" if rt == 0 else (
-            f"memcpy(&ctx->r[{rt}], ps2_ptr(ctx, {f['A']} & ~15u), 16);")
-    if op == 0x1F:  # sq
-        return f"memcpy(ps2_ptr(ctx, {f['A']} & ~15u), &ctx->r[{rt}], 16);"
-    if op in (0x2F, 0x33):  # cache, pref
-        return ""
-    if op == 0x31:  # lwc1
-        return f"F({rt}) = ps2_rd32(ctx, {f['A']});"
-    if op == 0x39:  # swc1
-        return f"ps2_wr32(ctx, {f['A']}, F({rt}));"
-    if op == 0x10:
-        return cop0(w)
-    if op == 0x11:
-        return cop1(w)
-    if op == 0x1C:
-        return mmi(w)
-    return None
-
-
-def ctrl(w, pc):
-    """Classify a control-flow instruction; None if it is not one."""
-    op = w >> 26
-    rs, rt = (w >> 21) & 31, (w >> 16) & 31
-    simm = sx16(w & 0xFFFF)
-    tgt = (pc + 4 + (simm << 2)) & 0xFFFFFFFF
-    RS, RT = M(rs), M(rt)
-    if op == 0x10:
-        if rs == 0x10 and (w & 63) == 0x18:      # eret: returns from a (guest) kernel handler
-            return dict(kind="eret")
-        if rs == 8 and rt in (0, 1, 2, 3):        # bc0f/bc0t: condition modelled as always true
-            return dict(kind="cond", tgt=tgt, cond="0" if rt in (0, 2) else "1",
-                        likely=rt in (2, 3))
-        return None
-    if op == 0:
-        fn = w & 63
-        if fn == 8:
-            return dict(kind="ret" if rs == 31 else "jr", rs=rs)
-        if fn == 9:
-            return dict(kind="jalr", rs=rs, rd=(w >> 11) & 31)
-        return None
-    if op == 1:
-        if rt in (0, 1, 2, 3):
-            cond = f"(s64){RS} < 0" if rt in (0, 2) else f"(s64){RS} >= 0"
-            return dict(kind="cond", tgt=tgt, cond=cond, likely=rt in (2, 3))
-        if rt == 0x11 and rs == 0:
-            return dict(kind="bal", tgt=tgt)
-        return None  # bltzal etc: reported as unimplemented
-    if op == 0x11 and rs == 8 and rt in (0, 1, 2, 3):  # bc1f/bc1t (+likely)
-        cond = ("!(ctx->fcr31 & 0x800000u)" if rt in (0, 2) else "(ctx->fcr31 & 0x800000u)")
-        return dict(kind="cond", tgt=tgt, cond=cond, likely=rt in (2, 3))
-    if op == 2:
-        return dict(kind="j", tgt=((pc + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2))
-    if op == 3:
-        return dict(kind="jal", tgt=((pc + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2))
-    if op in (4, 5, 6, 7, 0x14, 0x15, 0x16, 0x17):
-        likely = op >= 0x14
-        base = op & 7
-        if base == 4 and rs == rt:
-            return dict(kind="b", tgt=tgt)
-        cond = {4: f"{RS} == {RT}", 5: f"{RS} != {RT}",
-                6: f"(s64){RS} <= 0", 7: f"(s64){RS} > 0"}[base]
-        return dict(kind="cond", tgt=tgt, cond=cond, likely=likely)
-    return None
-
-
-def analyze(entry, code, entries):
-    flow, seen, calls = set(), set(), set()
-    work = [entry]
-    while work:
-        pc = work.pop()
-        while pc in code and pc not in flow:
-            flow.add(pc)
-            seen.add(pc)
-            c = ctrl(code[pc], pc)
-            if c is None:
-                pc += 4
-                continue
-            seen.add(pc + 4)
-            k = c["kind"]
-            if k in ("ret", "jr", "eret"):
-                break
-            if k == "j":
-                t = c["tgt"]
-                if not ((t in entries and t != entry) or t not in code):
-                    work.append(t)
-                break
-            if k == "b":
-                work.append(c["tgt"])
-                break
-            if k in ("jal", "bal"):
-                calls.add(c["tgt"])
-                pc += 8
-            elif k == "jalr":
-                pc += 8
-            else:  # cond
-                work.append(c["tgt"])
-                pc += 8
-    return flow, seen, calls
-
-
-def syscall_number(code, pc):
-    """Best-effort: the constant loaded into $v1 shortly before a `syscall`."""
-    for k in range(1, 6):
-        w = code.get(pc - 4 * k)
-        if w is None:
-            return None
-        op, rs, rt, rd = w >> 26, (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
-        if rt == 3 and op in (0x09, 0x19, 0x0D) and rs == 0:
-            return (w & 0xFFFF) if op == 0x0D else sx16(w & 0xFFFF)
-        if (op == 0 and rd == 3) or (op in IMM_D and rt == 3):
-            return None
-    return None
-
-
-def lift_function(entry, flow, code, entries, st):
-    out, refs = {}, set()
-
-    def lift_simple(w, pc, count):
-        c = simple(w, pc)
-        if count:
-            st.total += 1
-            if c is None:
-                st.bad(describe(w), pc)
-            else:
-                st.ok += 1
-        return c if c is not None else f"ps2_unimpl(ctx, 0x{pc:08x}u, 0x{w:08x}u);"
-
-    def go(a):
-        refs.add(a)
-        return f"goto L_{a:08x};"
-
-    def call(t):
-        return f"f_{t:08x}(ctx);" if t in entries else f"ps2_dispatch(ctx, 0x{t:08x}u);"
-
-    for pc in sorted(flow):
-        w = code[pc]
-        c = ctrl(w, pc)
-        if c is None:
-            if w >> 26 == 0 and (w & 63) == 0x0C:
-                e = st.sys.setdefault(syscall_number(code, pc), [0, pc])
-                e[0] += 1
-            out[pc] = lift_simple(w, pc, True)
-            if pc + 4 not in flow:
-                out[pc] += " return; /* ran off end of code */"
-            continue
-        st.total += 1
-        st.ok += 1
-        dl = lift_simple(code[pc + 4], pc + 4, False) if pc + 4 in code else ""
-        nxt = pc + 8
-        after = go(nxt) if nxt in flow else "return;"
-        link = f"G(31) = 0x{pc + 8:x}u;"
-        k = c["kind"]
-        if k == "eret":
-            out[pc] = "return;"
-        elif k == "ret":
-            out[pc] = f"{{ {dl} return; }}"
-        elif k == "jr":
-            st.indirect.append((pc, "jr"))
-            out[pc] = (f"{{ u32 t = (u32){M(c['rs'])}; {dl} "
-                       f"ps2_dispatch(ctx, t); return; }}")
-        elif k == "jalr":
-            st.indirect.append((pc, "jalr"))
-            out[pc] = (f"{{ u32 t = (u32){M(c['rs'])}; {W(c['rd'], f'0x{pc + 8:x}u')} "
-                       f"{dl} ps2_dispatch(ctx, t); }} {after}")
-        elif k in ("jal", "bal"):
-            out[pc] = f"{{ {link} {dl} {call(c['tgt'])} }} {after}"
-        elif k == "j":
-            t = c["tgt"]
-            if (t in entries and t != entry) or t not in flow:
-                out[pc] = f"{{ {dl} {call(t)} return; }}"
-            else:
-                out[pc] = f"{{ {dl} {go(t)} }}"
-        elif k == "b":
-            t = c["tgt"]
-            taken = go(t) if t in flow else f"{call(t)} return;"
-            out[pc] = f"{{ {dl} {taken} }}"
-        else:  # cond
-            t = c["tgt"]
-            taken = go(t) if t in flow else f"{call(t)} return;"
-            if c["likely"]:
-                out[pc] = f"if ({c['cond']}) {{ {dl} {taken} }} {after}"
-            else:
-                out[pc] = (f"{{ int c = ({c['cond']}); {dl} "
-                           f"if (c) {{ {taken} }} }} {after}")
-    lines = [f"void f_{entry:08x}(Ctx *ctx) {{"]
-    lo = min(flow)
-    if lo != entry:
-        lines.append("  " + go(entry))
-    for pc in sorted(flow):
-        lab = f"L_{pc:08x}:; " if pc in refs else ""
-        lines.append(f"  {lab}/* {pc:08x} */ {out[pc]}")
-    lines.append("}\n")
-    return "\n".join(lines)
-
-
+BAD_OPS = {0x13, 0x1D, 0x30, 0x32, 0x34, 0x35, 0x38, 0x3A, 0x3B, 0x3C, 0x3D}
+BAD_SPECIAL = {0x01, 0x05, 0x0E, 0x15, 0x1C, 0x1D, 0x1E, 0x1F, 0x30, 0x31, 0x32, 0x33,
+               0x34, 0x35, 0x36, 0x37, 0x39, 0x3D}
+VALID_REGIMM = {0, 1, 2, 3, 0x10, 0x11, 0x12, 0x13, 0x18, 0x19}
 JR_RA = 0x03E00008
 
 
-def plausible(w, pc):
-    return w != 0 and (ctrl(w, pc) is not None or simple(w, pc) is not None)
+def is_bad_word(w):
+    op = w >> 26
+    if op in BAD_OPS:
+        return True
+    if op == 0:
+        return (w & 63) in BAD_SPECIAL
+    if op == 1:
+        return ((w >> 16) & 31) not in VALID_REGIMM
+    return False
 
 
-def scan_seeds(elf, entries):
-    """Heuristic function discovery for code only reachable indirectly.
-    (a) the address right after a `jr ra` + delay slot, skipping nop padding;
-    (b) words anywhere in the image that point at code and look like a function start."""
-    code, data = elf.code, elf.data
-    a_set, b_set = set(), set()
-    for a, w in code.items():
-        if w == JR_RA and a + 8 in code:
-            s = a + 8
-            while code.get(s) == 0:
-                s += 4
-            if s in code and plausible(code[s], s):
-                a_set.add(s)
-    lo, hi = min(code), max(code) + 4
-    for v in data.values():
-        if lo <= v < hi and v % 4 == 0 and code.get(v, 0) != 0:
-            if (code.get(v - 8) == JR_RA or code.get(v - 4) == 0) and plausible(code[v], v):
-                b_set.add(v)
-    # (c) runs of >= 3 consecutive code pointers in data: switch tables and vtables.
-    # Their targets are case labels / methods, usually not function starts.
-    c_set, run = set(), []
+class Elf:
+    def __init__(self, blob):
+        if len(blob) < 52 or blob[:4] != b"\x7fELF":
+            raise ValueError("not an ELF file")
+        if blob[4] != 1 or blob[5] != 1 or struct.unpack_from("<H", blob, 18)[0] != 8:
+            raise ValueError("expected 32-bit little-endian MIPS ELF")
+        self.entry = struct.unpack_from("<I", blob, 24)[0]
+        phoff = struct.unpack_from("<I", blob, 28)[0]
+        phentsize = struct.unpack_from("<H", blob, 42)[0]
+        phnum = struct.unpack_from("<H", blob, 44)[0]
+        self.segments, self.data, self.phys_data = [], {}, {}
+        for i in range(phnum):
+            off = phoff + i * phentsize
+            p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, _ = struct.unpack_from(
+                "<8I", blob, off
+            )
+            if p_type != 1:
+                continue
+            seg = blob[p_offset:p_offset + p_filesz]
+            self.segments.append((p_vaddr, p_paddr, seg, p_memsz, p_flags))
+            for j in range(len(seg) // 4):
+                w = struct.unpack_from("<I", seg, j * 4)[0]
+                va = p_vaddr + j * 4
+                self.data[va] = w
+                self.phys_data[va & 0x1FFFFFFF] = w
 
-    def flush():
-        if len(run) >= 3:
-            c_set.update(v for _, v in run)
-
-    for addr in sorted(data):
-        v = data[addr]
-        ok = lo <= v < hi and v % 4 == 0 and code.get(v, 0) != 0 and plausible(code[v], v)
-        if ok and run and addr == run[-1][0] + 4:
-            run.append((addr, v))
-        else:
-            flush()
-            run = [(addr, v)] if ok else []
-    flush()
-    return a_set - entries, b_set - entries, c_set - entries
+    def get_word(self, addr):
+        return self.data[addr] if addr in self.data else self.phys_data.get(addr & 0x1FFFFFFF)
 
 
-def makefile_text():
-    return ("CC ?= cc\nCFLAGS ?= -O1 -w\nLDFLAGS ?= -rdynamic -pthread\n"
-            "SRC := $(wildcard generated*.c) func_table.c ps2rt.c\nOBJ := $(SRC:.c=.o)\n\n"
-            "game: $(OBJ)\n\t$(CC) $(LDFLAGS) -o $@ $(OBJ) -lm\n\n"
-            "%.o: %.c ps2rt.h\n\t$(CC) $(CFLAGS) -c $< -o $@\n\n"
-            "clean:\n\trm -f $(OBJ) game\n")
+def sx16(imm):
+    return imm - 0x10000 if (imm & 0x8000) else imm
 
 
-def write_if_changed(path, text):
-    try:
-        if open(path).read() == text:
-            return
-    except OSError:
-        pass
-    open(path, "w").write(text)
+def gpr_read(r):
+    return "0" if r == 0 else f"G({r})"
 
 
-def read_entries(path):
-    vals = set()
-    if path and os.path.exists(path):
-        for line in open(path):
-            line = line.strip()
-            if line:
-                vals.add(int(line, 16 if line.lower().startswith("0x") else 0))
-    return vals
+def gpr_write(r, expr):
+    return "" if r == 0 else f"G({r}) = {expr};"
+
+
+def lift_insn(pc, w, unimpl_counts, syscalls_seen, prev_v1_imm, vu0_macro=False):
+    op = (w >> 26) & 0x3F
+    rs = (w >> 21) & 0x1F
+    rt = (w >> 16) & 0x1F
+    rd = (w >> 11) & 0x1F
+    sa = (w >> 6) & 0x1F
+    fn = w & 0x3F
+    imm = w & 0xFFFF
+    simm = sx16(imm)
+
+    def unimpl(label):
+        unimpl_counts.setdefault(label, [0, pc])[0] += 1
+        return f"ps2_unimpl(ctx, 0x{pc:08x}u, 0x{w:08x}u);"
+
+    if w == 0:
+        return "", "normal", None
+    if op == 0x02:
+        return None, "j", ((pc + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2)
+    if op == 0x03:
+        return None, "jal", ((pc + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2)
+
+    if op in (0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17):
+        tgt = (pc + 4 + (simm << 2)) & 0xFFFFFFFF
+        likely = op >= 0x14
+        base_op = op - 0x10 if likely else op
+        s_expr, t_expr = gpr_read(rs), gpr_read(rt)
+        cond = {
+            0x04: f"({s_expr} == {t_expr})",
+            0x05: f"({s_expr} != {t_expr})",
+            0x06: f"((s64){s_expr} <= 0LL)",
+            0x07: f"((s64){s_expr} > 0LL)",
+        }[base_op]
+        return (cond, likely, False), "branch", tgt
+
+    if op == 0x01:
+        if rt in (0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13):
+            tgt = (pc + 4 + (simm << 2)) & 0xFFFFFFFF
+            cond = f"((s64){gpr_read(rs)} >= 0LL)" if (rt & 1) else f"((s64){gpr_read(rs)} < 0LL)"
+            return (cond, bool(rt & 2), bool(rt & 0x10)), "branch", tgt
+        if rt == 0x18:
+            return f"ctx->sa = (((u32){gpr_read(rs)} ^ {imm}u) & 15u) * 8u;", "normal", None
+        if rt == 0x19:
+            return f"ctx->sa = (((u32){gpr_read(rs)} ^ {imm}u) & 7u) * 16u;", "normal", None
+        return unimpl(f"REGIMM rt=0x{rt:02x}"), "normal", None
+
+    if op == 0x00:
+        if fn == 0x08:
+            return (None, "jr_ra", None) if rs == 31 else (gpr_read(rs), "jr", None)
+        if fn == 0x09:
+            return (gpr_read(rs), rd), "jalr", None
+        if fn == 0x0C:
+            if pc in prev_v1_imm:
+                syscalls_seen.add(prev_v1_imm[pc])
+            return f"ps2_syscall(ctx, 0x{pc:08x}u);", "normal", None
+        if fn == 0x0D:
+            return f"ps2_break(ctx, 0x{pc:08x}u);", "normal", None
+        if fn == 0x0F:
+            return "/* sync */", "normal", None
+        alu = {
+            0x00: gpr_write(rd, f"SX32((u32){gpr_read(rt)} << {sa})"),
+            0x02: gpr_write(rd, f"SX32((u32){gpr_read(rt)} >> {sa})"),
+            0x03: gpr_write(rd, f"SX32((s32){gpr_read(rt)} >> {sa})"),
+            0x04: gpr_write(rd, f"SX32((u32){gpr_read(rt)} << ({gpr_read(rs)} & 31u))"),
+            0x06: gpr_write(rd, f"SX32((u32){gpr_read(rt)} >> ({gpr_read(rs)} & 31u))"),
+            0x07: gpr_write(rd, f"SX32((s32){gpr_read(rt)} >> ({gpr_read(rs)} & 31u))"),
+            0x0A: f"if ({gpr_read(rt)} == 0) {{ {gpr_write(rd, gpr_read(rs))} }}",
+            0x0B: f"if ({gpr_read(rt)} != 0) {{ {gpr_write(rd, gpr_read(rs))} }}",
+            0x10: gpr_write(rd, "HI"),
+            0x11: f"HI = {gpr_read(rs)};",
+            0x12: gpr_write(rd, "LO"),
+            0x13: f"LO = {gpr_read(rs)};",
+            0x14: gpr_write(rd, f"({gpr_read(rt)} << ({gpr_read(rs)} & 63u))"),
+            0x16: gpr_write(rd, f"({gpr_read(rt)} >> ({gpr_read(rs)} & 63u))"),
+            0x17: gpr_write(rd, f"(u64)((s64){gpr_read(rt)} >> ({gpr_read(rs)} & 63u))"),
+            0x1A: f"ps2_div(ctx, {gpr_read(rs)}, {gpr_read(rt)});",
+            0x1B: f"ps2_divu(ctx, {gpr_read(rs)}, {gpr_read(rt)});",
+            0x20: gpr_write(rd, f"SX32((u32){gpr_read(rs)} + (u32){gpr_read(rt)})"),
+            0x21: gpr_write(rd, f"SX32((u32){gpr_read(rs)} + (u32){gpr_read(rt)})"),
+            0x22: gpr_write(rd, f"SX32((u32){gpr_read(rs)} - (u32){gpr_read(rt)})"),
+            0x23: gpr_write(rd, f"SX32((u32){gpr_read(rs)} - (u32){gpr_read(rt)})"),
+            0x24: gpr_write(rd, f"({gpr_read(rs)} & {gpr_read(rt)})"),
+            0x25: gpr_write(rd, f"({gpr_read(rs)} | {gpr_read(rt)})"),
+            0x26: gpr_write(rd, f"({gpr_read(rs)} ^ {gpr_read(rt)})"),
+            0x27: gpr_write(rd, f"~({gpr_read(rs)} | {gpr_read(rt)})"),
+            0x28: gpr_write(rd, "(u64)ctx->sa"),
+            0x29: f"ctx->sa = (u32){gpr_read(rs)} & 127u;",
+            0x2A: gpr_write(rd, f"(u64)((s64){gpr_read(rs)} < (s64){gpr_read(rt)})"),
+            0x2B: gpr_write(rd, f"(u64)({gpr_read(rs)} < {gpr_read(rt)})"),
+            0x2C: gpr_write(rd, f"({gpr_read(rs)} + {gpr_read(rt)})"),
+            0x2D: gpr_write(rd, f"({gpr_read(rs)} + {gpr_read(rt)})"),
+            0x2E: gpr_write(rd, f"({gpr_read(rs)} - {gpr_read(rt)})"),
+            0x2F: gpr_write(rd, f"({gpr_read(rs)} - {gpr_read(rt)})"),
+            0x38: gpr_write(rd, f"({gpr_read(rt)} << {sa})"),
+            0x3A: gpr_write(rd, f"({gpr_read(rt)} >> {sa})"),
+            0x3B: gpr_write(rd, f"(u64)((s64){gpr_read(rt)} >> {sa})"),
+            0x3C: gpr_write(rd, f"({gpr_read(rt)} << {sa + 32})"),
+            0x3E: gpr_write(rd, f"({gpr_read(rt)} >> {sa + 32})"),
+            0x3F: gpr_write(rd, f"(u64)((s64){gpr_read(rt)} >> {sa + 32})"),
+        }
+        if fn in alu:
+            return alu[fn], "normal", None
+        if fn == 0x18:
+            wr = f" {gpr_write(rd, 'LO')}" if rd else ""
+            return (f"{{ s64 p = (s64)(s32){gpr_read(rs)} * (s64)(s32){gpr_read(rt)}; "
+                    f"LO = SX32((u32)p); HI = SX32((u32)((u64)p >> 32));{wr} }}"), "normal", None
+        if fn == 0x19:
+            wr = f" {gpr_write(rd, 'LO')}" if rd else ""
+            return (f"{{ u64 p = (u64)(u32){gpr_read(rs)} * (u64)(u32){gpr_read(rt)}; "
+                    f"LO = SX32((u32)p); HI = SX32((u32)(p >> 32));{wr} }}"), "normal", None
+        return unimpl(f"SPECIAL fn=0x{fn:02x}"), "normal", None
+
+    if op in (0x08, 0x09):
+        return gpr_write(rt, f"SX32({gpr_read(rs)} + (u64)({simm}LL))"), "normal", None
+    if op == 0x0A:
+        return gpr_write(rt, f"(u64)((s64){gpr_read(rs)} < {simm}LL)"), "normal", None
+    if op == 0x0B:
+        return gpr_write(rt, f"(u64)({gpr_read(rs)} < (u64)(s64){simm}LL)"), "normal", None
+    if op == 0x0C:
+        return gpr_write(rt, f"({gpr_read(rs)} & {imm}u)"), "normal", None
+    if op == 0x0D:
+        return gpr_write(rt, f"({gpr_read(rs)} | {imm}u)"), "normal", None
+    if op == 0x0E:
+        return gpr_write(rt, f"({gpr_read(rs)} ^ {imm}u)"), "normal", None
+    if op == 0x0F:
+        val = ((imm << 16) & 0xFFFFFFFF) | (0xFFFFFFFF00000000 if (imm & 0x8000) else 0)
+        return gpr_write(rt, f"0x{val:x}ull"), "normal", None
+    if op in (0x18, 0x19):
+        return gpr_write(rt, f"({gpr_read(rs)} + (u64)(s64){simm}LL)"), "normal", None
+
+    eff = f"(u32)({gpr_read(rs)} + (u64)({simm}LL))"
+    mem_ops = {
+        0x1A: gpr_write(rt, f"ps2_ldl(ctx, {eff}, {gpr_read(rt)})"),
+        0x1B: gpr_write(rt, f"ps2_ldr(ctx, {eff}, {gpr_read(rt)})"),
+        0x1E: (f"memcpy(&ctx->r[{rt}], ps2_ptr(ctx, {eff} & ~15u), 16);" if rt else ""),
+        0x1F: f"memcpy(ps2_ptr(ctx, {eff} & ~15u), &ctx->r[{rt}], 16);",
+        0x20: gpr_write(rt, f"(u64)(s64)(s8)ps2_rd8(ctx, {eff})"),
+        0x21: gpr_write(rt, f"(u64)(s64)(s16)ps2_rd16(ctx, {eff})"),
+        0x22: gpr_write(rt, f"SX32(ps2_lwl(ctx, {eff}, (u32){gpr_read(rt)}))"),
+        0x23: gpr_write(rt, f"SX32(ps2_rd32(ctx, {eff}))"),
+        0x24: gpr_write(rt, f"(u64)ps2_rd8(ctx, {eff})"),
+        0x25: gpr_write(rt, f"(u64)ps2_rd16(ctx, {eff})"),
+        0x26: gpr_write(rt, f"SX32(ps2_lwr(ctx, {eff}, (u32){gpr_read(rt)}))"),
+        0x27: gpr_write(rt, f"(u64)ps2_rd32(ctx, {eff})"),
+        0x28: f"ps2_wr8(ctx, {eff}, (u8){gpr_read(rt)});",
+        0x29: f"ps2_wr16(ctx, {eff}, (u16){gpr_read(rt)});",
+        0x2A: f"ps2_swl(ctx, {eff}, (u32){gpr_read(rt)});",
+        0x2B: f"ps2_wr32(ctx, {eff}, (u32){gpr_read(rt)});",
+        0x2C: f"ps2_sdl(ctx, {eff}, {gpr_read(rt)});",
+        0x2D: f"ps2_sdr(ctx, {eff}, {gpr_read(rt)});",
+        0x2E: f"ps2_swr(ctx, {eff}, (u32){gpr_read(rt)});",
+        0x33: "/* pref */",
+        0x37: gpr_write(rt, f"ps2_rd64(ctx, {eff})"),
+        0x3F: f"ps2_wr64(ctx, {eff}, {gpr_read(rt)});",
+    }
+    if op in mem_ops:
+        return mem_ops[op], "normal", None
+
+    if op == 0x10:
+        if rs == 0x00:
+            return gpr_write(rt, f"SX32(ps2_cop0_read(ctx, {rd}))"), "normal", None
+        if rs == 0x04:
+            return f"ps2_cop0_write(ctx, {rd}, (u32){gpr_read(rt)});", "normal", None
+        if rs == 0x10 and fn == 0x18:
+            return "return;", "eret", None
+        if rs == 0x10 and fn == 0x38:
+            return "ps2_cop0_ei(ctx);", "normal", None
+        if rs == 0x10 and fn == 0x39:
+            return "ps2_cop0_di(ctx);", "normal", None
+        if rs == 0x10 and fn in (0x01, 0x02, 0x06, 0x08):
+            return "/* tlb */", "normal", None
+        return unimpl(f"COP0 rs=0x{rs:02x} fn=0x{fn:02x}"), "normal", None
+
+    if op == 0x31:
+        return f"F({rt}) = ps2_rd32(ctx, {eff});", "normal", None
+    if op == 0x39:
+        return f"ps2_wr32(ctx, {eff}, F({rt}));", "normal", None
+    if op == 0x11:
+        if rs == 0x00:
+            return gpr_write(rt, f"SX32(F({rd}))"), "normal", None
+        if rs == 0x02:
+            return gpr_write(rt, f"SX32(ps2_cfc1(ctx, {rd}))"), "normal", None
+        if rs == 0x04:
+            return f"F({rd}) = (u32){gpr_read(rt)};", "normal", None
+        if rs == 0x06:
+            return f"ps2_ctc1(ctx, {rd}, (u32){gpr_read(rt)});", "normal", None
+        if rs == 0x08:
+            tgt = (pc + 4 + (simm << 2)) & 0xFFFFFFFF
+            cond = "((ctx->fcr31 & 0x800000u) != 0)" if (rt & 1) else "((ctx->fcr31 & 0x800000u) == 0)"
+            return (cond, bool(rt & 2), False), "branch", tgt
+        if rs == 0x10:
+            fs, ft, fd = rd, rt, sa
+            fpu_s = {
+                0x00: f"F({fd}) = ps2_fix(ps2_f(F({fs})) + ps2_f(F({ft})));",
+                0x01: f"F({fd}) = ps2_fix(ps2_f(F({fs})) - ps2_f(F({ft})));",
+                0x02: f"F({fd}) = ps2_fix(ps2_f(F({fs})) * ps2_f(F({ft})));",
+                0x03: f"F({fd}) = ps2_fix(ps2_f(F({fs})) / ps2_f(F({ft})));",
+                0x04: f"F({fd}) = ps2_fix(sqrtf(fabsf(ps2_f(F({ft})))));",
+                0x05: f"F({fd}) = F({fs}) & 0x7FFFFFFFu;",
+                0x06: f"F({fd}) = F({fs});",
+                0x07: f"F({fd}) = F({fs}) ^ 0x80000000u;",
+                0x16: f"F({fd}) = ps2_fix(ps2_f(F({fs})) / sqrtf(fabsf(ps2_f(F({ft})))));",
+                0x18: f"ctx->facc = ps2_fix(ps2_f(F({fs})) + ps2_f(F({ft})));",
+                0x19: f"ctx->facc = ps2_fix(ps2_f(F({fs})) - ps2_f(F({ft})));",
+                0x1A: f"ctx->facc = ps2_fix(ps2_f(F({fs})) * ps2_f(F({ft})));",
+                0x1C: f"F({fd}) = ps2_fix(ps2_f(ctx->facc) + ps2_f(F({fs})) * ps2_f(F({ft})));",
+                0x1D: f"F({fd}) = ps2_fix(ps2_f(ctx->facc) - ps2_f(F({fs})) * ps2_f(F({ft})));",
+                0x1E: f"ctx->facc = ps2_fix(ps2_f(ctx->facc) + ps2_f(F({fs})) * ps2_f(F({ft})));",
+                0x1F: f"ctx->facc = ps2_fix(ps2_f(ctx->facc) - ps2_f(F({fs})) * ps2_f(F({ft})));",
+                0x24: f"F({fd}) = ps2_cvtws(ps2_f(F({fs})));",
+                0x28: f"{{ float a = ps2_f(F({fs})), b = ps2_f(F({ft})); F({fd}) = ps2_fix(a > b ? a : b); }}",
+                0x29: f"{{ float a = ps2_f(F({fs})), b = ps2_f(F({ft})); F({fd}) = ps2_fix(a < b ? a : b); }}",
+                0x30: "ps2_fc(ctx, 0);",
+                0x32: f"ps2_fc(ctx, ps2_f(F({fs})) == ps2_f(F({ft})));",
+                0x34: f"ps2_fc(ctx, ps2_f(F({fs})) < ps2_f(F({ft})));",
+                0x36: f"ps2_fc(ctx, ps2_f(F({fs})) <= ps2_f(F({ft})));",
+            }
+            if fn in fpu_s:
+                return fpu_s[fn], "normal", None
+        if rs == 0x14 and fn == 0x20:
+            return f"F({sa}) = ps2_fix((float)(s32)F({rd}));", "normal", None
+        return unimpl(f"COP1 rs=0x{rs:02x} fn=0x{fn:02x}"), "normal", None
+
+    if op == 0x1C:
+        if fn == 0x00:
+            wr = f" {gpr_write(rd, 'LO')}" if rd else ""
+            return (f"{{ s64 acc = ((s64)(s32)HI << 32) | (u32)LO; "
+                    f"acc += (s64)(s32){gpr_read(rs)} * (s64)(s32){gpr_read(rt)}; "
+                    f"LO = SX32((u32)acc); HI = SX32((u32)((u64)acc >> 32));{wr} }}"), "normal", None
+        if fn == 0x01:
+            wr = f" {gpr_write(rd, 'LO')}" if rd else ""
+            return (f"{{ u64 acc = ((u64)(u32)HI << 32) | (u32)LO; "
+                    f"acc += (u64)(u32){gpr_read(rs)} * (u64)(u32){gpr_read(rt)}; "
+                    f"LO = SX32((u32)acc); HI = SX32((u32)(acc >> 32));{wr} }}"), "normal", None
+        if fn == 0x04:
+            return (f"ps2_plzcw(&ctx->r[{rd}], &ctx->r[{rs}]);" if rd else ""), "normal", None
+        if fn in (0x10, 0x11, 0x12, 0x13, 0x1A, 0x1B):
+            m1 = {
+                0x10: gpr_write(rd, "ctx->hi[1]"),
+                0x11: f"ctx->hi[1] = {gpr_read(rs)};",
+                0x12: gpr_write(rd, "ctx->lo[1]"),
+                0x13: f"ctx->lo[1] = {gpr_read(rs)};",
+                0x1A: f"ps2_div1(ctx, {gpr_read(rs)}, {gpr_read(rt)});",
+                0x1B: f"ps2_divu1(ctx, {gpr_read(rs)}, {gpr_read(rt)});",
+            }
+            return m1[fn], "normal", None
+        if fn == 0x18:
+            wr = f" {gpr_write(rd, 'ctx->lo[1]')}" if rd else ""
+            return (f"{{ s64 p = (s64)(s32){gpr_read(rs)} * (s64)(s32){gpr_read(rt)}; "
+                    f"ctx->lo[1] = SX32((u32)p); ctx->hi[1] = SX32((u32)((u64)p >> 32));{wr} }}"), "normal", None
+        if fn == 0x19:
+            wr = f" {gpr_write(rd, 'ctx->lo[1]')}" if rd else ""
+            return (f"{{ u64 p = (u64)(u32){gpr_read(rs)} * (u64)(u32){gpr_read(rt)}; "
+                    f"ctx->lo[1] = SX32((u32)p); ctx->hi[1] = SX32((u32)(p >> 32));{wr} }}"), "normal", None
+        if fn == 0x20:
+            wr = f" {gpr_write(rd, 'ctx->lo[1]')}" if rd else ""
+            return (f"{{ s64 acc = ((s64)(s32)ctx->hi[1] << 32) | (u32)ctx->lo[1]; "
+                    f"acc += (s64)(s32){gpr_read(rs)} * (s64)(s32){gpr_read(rt)}; "
+                    f"ctx->lo[1] = SX32((u32)acc); ctx->hi[1] = SX32((u32)((u64)acc >> 32));{wr} }}"), "normal", None
+        if fn == 0x21:
+            wr = f" {gpr_write(rd, 'ctx->lo[1]')}" if rd else ""
+            return (f"{{ u64 acc = ((u64)(u32)ctx->hi[1] << 32) | (u32)ctx->lo[1]; "
+                    f"acc += (u64)(u32){gpr_read(rs)} * (u64)(u32){gpr_read(rt)}; "
+                    f"ctx->lo[1] = SX32((u32)acc); ctx->hi[1] = SX32((u32)(acc >> 32));{wr} }}"), "normal", None
+        sh_map = {0x34: "psllh", 0x36: "psrlh", 0x37: "psrah", 0x3C: "psllw", 0x3E: "psrlw", 0x3F: "psraw"}
+        if fn in sh_map:
+            return (f"ps2_{sh_map[fn]}(&ctx->r[{rd}], &ctx->r[{rt}], {sa});" if rd else ""), "normal", None
+        mmi0 = {
+            0x00: "paddw", 0x01: "psubw", 0x02: "pcgtw", 0x03: "pmaxw",
+            0x04: "paddh", 0x05: "psubh", 0x06: "pcgth", 0x07: "pmaxh",
+            0x08: "paddb", 0x09: "psubb", 0x0A: "pcgtb",
+            0x10: "paddsw", 0x11: "psubsw", 0x12: "pextlw", 0x13: "ppacw",
+            0x14: "paddsh", 0x15: "psubsh", 0x16: "pextlh", 0x17: "ppach",
+            0x18: "paddsb", 0x19: "psubsb", 0x1A: "pextlb", 0x1B: "ppacb",
+        }
+        if fn == 0x08 and sa in mmi0:
+            return (f"ps2_{mmi0[sa]}(&ctx->r[{rd}], &ctx->r[{rs}], &ctx->r[{rt}]);" if rd else ""), "normal", None
+        mmi1 = {
+            0x01: "pabsw", 0x02: "pceqw", 0x03: "pminw",
+            0x05: "pabsh", 0x06: "pceqh", 0x07: "pminh",
+            0x0A: "pceqb", 0x10: "padduw", 0x11: "psubuw", 0x12: "pextuw",
+            0x14: "padduh", 0x15: "psubuh", 0x16: "pextuh",
+            0x18: "paddub", 0x19: "psubub", 0x1A: "pextub",
+        }
+        if fn == 0x28:
+            if sa in mmi1:
+                return (f"ps2_{mmi1[sa]}(&ctx->r[{rd}], &ctx->r[{rs}], &ctx->r[{rt}]);" if rd else ""), "normal", None
+            if sa == 0x1B:
+                return (f"ps2_qfsrv(&ctx->r[{rd}], &ctx->r[{rs}], &ctx->r[{rt}], ctx->sa);" if rd else ""), "normal", None
+        if fn == 0x09:
+            if sa == 0x08:
+                return (f"{{ ctx->r[{rd}].d[0] = HI; ctx->r[{rd}].d[1] = ctx->hi[1]; }}" if rd else ""), "normal", None
+            if sa == 0x09:
+                return (f"{{ ctx->r[{rd}].d[0] = LO; ctx->r[{rd}].d[1] = ctx->lo[1]; }}" if rd else ""), "normal", None
+            if sa in (0x0E, 0x12, 0x13):
+                nm = {0x0E: "pcpyld", 0x12: "pand", 0x13: "pxor"}[sa]
+                return (f"ps2_{nm}(&ctx->r[{rd}], &ctx->r[{rs}], &ctx->r[{rt}]);" if rd else ""), "normal", None
+        if fn == 0x29:
+            if sa == 0x08:
+                return f"{{ HI = ctx->r[{rs}].d[0]; ctx->hi[1] = ctx->r[{rs}].d[1]; }}", "normal", None
+            if sa == 0x09:
+                return f"{{ LO = ctx->r[{rs}].d[0]; ctx->lo[1] = ctx->r[{rs}].d[1]; }}", "normal", None
+            if sa in (0x0E, 0x12, 0x13, 0x1B):
+                nm = {0x0E: "pcpyud", 0x12: "por", 0x13: "pnor", 0x1B: "pcpyh"}[sa]
+                return (f"ps2_{nm}(&ctx->r[{rd}], &ctx->r[{rs}], &ctx->r[{rt}]);" if rd else ""), "normal", None
+        return unimpl(f"MMI funct=0x{fn:02x} sa=0x{sa:02x}"), "normal", None
+
+    if op == 0x36:
+        return (f"ps2_vu0_lqc2(ctx, {rt}, {eff});", "normal", None) if vu0_macro else (unimpl("LQC2"), "normal", None)
+    if op == 0x3E:
+        return (f"ps2_vu0_sqc2(ctx, {rt}, {eff});", "normal", None) if vu0_macro else (unimpl("SQC2"), "normal", None)
+    if op == 0x12:
+        if vu0_macro and w != 0x4A000000:
+            return f"ps2_vu0_macro(ctx, 0x{w:08x}u);", "normal", None
+        if rs >= 0x10:
+            return unimpl(f"COP2 (VU0 macro) CO funct=0x{fn:02x} bits10_6=0x{sa:02x}"), "normal", None
+        return unimpl(f"COP2(VU0 macro) rs/fmt=0x{rs:02x}"), "normal", None
+
+    return unimpl(f"op=0x{op:02x}"), "normal", None
+
+
+def compute_prev_v1(mem_words):
+    out = {}
+    for pc, w in mem_words.items():
+        if w == 0x0000000C:
+            for back in (4, 8):
+                pw = mem_words.get(pc - back)
+                if pw is not None:
+                    op, rs, rt, imm = (pw >> 26) & 0x3F, (pw >> 21) & 0x1F, (pw >> 16) & 0x1F, pw & 0xFFFF
+                    if rt == 3 and rs == 0 and op in (0x08, 0x09, 0x0D):
+                        out[pc] = sx16(imm) if op in (0x08, 0x09) else imm
+                        break
+    return out
+
+
+def is_branch_word(w):
+    op, rs, rt = (w >> 26) & 0x3F, (w >> 21) & 0x1F, (w >> 16) & 0x1F
+    return (
+        op in (0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17)
+        or (op == 0x01 and rt in (0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13))
+        or (op in (0x11, 0x12) and rs == 0x08)
+    )
+
+
+def trace_function(entry, mem_words, code_lo, code_hi):
+    visited, queue, direct_calls = set(), deque([entry]), set()
+    while queue:
+        pc = queue.popleft()
+        while pc not in visited:
+            w = mem_words.get(pc)
+            if w is None:
+                break
+            visited.add(pc)
+            op, rs, fn, simm = (w >> 26) & 0x3F, (w >> 21) & 0x1F, w & 0x3F, sx16(w & 0xFFFF)
+            if op == 0x10 and rs == 0x10 and fn == 0x18:
+                break
+            if op in (0x02, 0x03):
+                if pc + 4 in mem_words:
+                    visited.add(pc + 4)
+                tgt = ((pc + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2)
+                if op == 0x03:
+                    direct_calls.add(tgt)
+                    queue.append(pc + 8)
+                break
+            if op == 0x00 and fn in (0x08, 0x09):
+                if pc + 4 in mem_words:
+                    visited.add(pc + 4)
+                if fn == 0x09:
+                    queue.append(pc + 8)
+                break
+            if is_branch_word(w):
+                if pc + 4 in mem_words:
+                    visited.add(pc + 4)
+                tgt = (pc + 4 + (simm << 2)) & 0xFFFFFFFF
+                if code_lo <= tgt < code_hi and tgt in mem_words:
+                    queue.append(tgt)
+                queue.append(pc + 8)
+                break
+            pc += 4
+    return visited, direct_calls
+
+
+def emit_function(entry, func_entries, mem_words, code_lo, code_hi, unimpl_counts, syscalls_seen, prev_v1, vu0_macro):
+    visited, labels, queue = set(), set(), deque([entry])
+    while queue:
+        pc = queue.popleft()
+        while pc not in visited:
+            w = mem_words.get(pc)
+            if w is None:
+                break
+            visited.add(pc)
+            op, rs, fn, simm = (w >> 26) & 0x3F, (w >> 21) & 0x1F, w & 0x3F, sx16(w & 0xFFFF)
+            if op == 0x10 and rs == 0x10 and fn == 0x18:
+                break
+            if op in (0x02, 0x03):
+                if pc + 4 in mem_words:
+                    visited.add(pc + 4)
+                tgt = ((pc + 4) & 0xF0000000) | ((w & 0x3FFFFFF) << 2)
+                if op == 0x03:
+                    labels.add(pc + 8)
+                    queue.append(pc + 8)
+                elif (tgt not in func_entries or tgt == entry) and code_lo <= tgt < code_hi and tgt in mem_words:
+                    labels.add(tgt)
+                    queue.append(tgt)
+                break
+            if op == 0x00 and fn in (0x08, 0x09):
+                if pc + 4 in mem_words:
+                    visited.add(pc + 4)
+                if fn == 0x09:
+                    labels.add(pc + 8)
+                    queue.append(pc + 8)
+                break
+            if is_branch_word(w):
+                if pc + 4 in mem_words:
+                    visited.add(pc + 4)
+                tgt = (pc + 4 + (simm << 2)) & 0xFFFFFFFF
+                if code_lo <= tgt < code_hi and tgt in mem_words:
+                    labels.add(tgt)
+                    queue.append(tgt)
+                labels.add(pc + 8)
+                queue.append(pc + 8)
+                break
+            pc += 4
+
+    out = [f"void f_{entry:08x}(Ctx *ctx) {{"]
+    skip_next, lifted_insns = False, 0
+    for pc in sorted(visited):
+        if skip_next:
+            skip_next = False
+            continue
+        w = mem_words[pc]
+        lifted_insns += 1
+        lbl = f"  L_{pc:08x}:; " if (pc in labels and pc != entry) else "  "
+        stmt, kind, aux = lift_insn(pc, w, unimpl_counts, syscalls_seen, prev_v1, vu0_macro)
+        if kind in ("normal", "eret"):
+            out.append(f"{lbl}/* {pc:08x} */ {stmt}")
+            continue
+        dw = mem_words.get(pc + 4, 0)
+        raw_dstmt, _, _ = lift_insn(pc + 4, dw, unimpl_counts, syscalls_seen, prev_v1, vu0_macro)
+        dstmt = raw_dstmt if isinstance(raw_dstmt, str) else "/* branch in delay slot */"
+        skip_next = True
+        lifted_insns += 1
+        if kind == "jr_ra":
+            out.append(f"{lbl}/* {pc:08x} */ {{ {dstmt} return; }}")
+        elif kind == "jr":
+            out.append(f"{lbl}/* {pc:08x} */ {{ u32 t = (u32){stmt}; {dstmt} ps2_dispatch(ctx, t); return; }}")
+        elif kind == "jalr":
+            reg_expr, link_reg = stmt
+            set_ra = f"{gpr_write(link_reg, f'SX32(0x{pc + 8:08x}u)')} " if link_reg else ""
+            out.append(f"{lbl}/* {pc:08x} */ {{ u32 t = (u32){reg_expr}; {set_ra}{dstmt} ps2_dispatch(ctx, t); }} goto L_{pc + 8:08x};")
+        elif kind == "jal":
+            tgt = aux
+            callee = f"f_{tgt:08x}(ctx)" if tgt in func_entries else f"ps2_dispatch(ctx, 0x{tgt:08x}u)"
+            out.append(f"{lbl}/* {pc:08x} */ {{ G(31) = SX32(0x{pc + 8:08x}u); {dstmt} {callee}; }} goto L_{pc + 8:08x};")
+        elif kind == "j":
+            tgt = aux
+            if tgt in func_entries and tgt != entry:
+                out.append(f"{lbl}/* {pc:08x} */ {{ {dstmt} f_{tgt:08x}(ctx); return; }}")
+            elif tgt in labels:
+                out.append(f"{lbl}/* {pc:08x} */ {{ {dstmt} goto L_{tgt:08x}; }}")
+            else:
+                out.append(f"{lbl}/* {pc:08x} */ {{ {dstmt} ps2_dispatch(ctx, 0x{tgt:08x}u); return; }}")
+        elif kind == "branch":
+            cond, likely, link = stmt
+            tgt = aux
+            link_code = f"G(31) = SX32(0x{pc + 8:08x}u); " if link else ""
+            taken_dst = "" if tgt == pc + 4 else (f"goto L_{tgt:08x};" if tgt in labels else f"ps2_dispatch(ctx, 0x{tgt:08x}u); return;")
+            if likely:
+                out.append(f"{lbl}/* {pc:08x} */ {{ int c = {cond}; {link_code}if (c) {{ {dstmt} {taken_dst} }} }} goto L_{pc + 8:08x};")
+            else:
+                out.append(f"{lbl}/* {pc:08x} */ {{ int c = {cond}; {link_code}{dstmt} if (c) {{ {taken_dst} }} }} goto L_{pc + 8:08x};")
+    out.append("}\n")
+    emitted = set(re.findall(r"\bL_([0-9a-fA-F]{8}):", "\n".join(out)))
+    out = [
+        re.sub(
+            r"goto L_([0-9a-fA-F]{8});",
+            lambda m: m.group(0) if m.group(1) in emitted else f"ps2_dispatch(ctx, 0x{m.group(1)}u); return;",
+            line,
+        )
+        for line in out
+    ]
+    return "\n".join(out), lifted_insns
+
+
+def write_if_changed(path, content):
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                if f.read() == content:
+                    return False
+        except OSError:
+            pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return True
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("elf", nargs="?")
-    ap.add_argument("-o", "--outdir", default="out")
-    ap.add_argument("--sync-runtime", metavar="DIR",
-                    help="only copy runtime/ps2rt.{h,c} into DIR (skips the slow lift)")
-    ap.add_argument("--entries", help="file of extra function entry addresses "
-                    "(e.g. the runtime's missing_entries.txt)")
-    ap.add_argument("--add", action="append", default=[],
-                    help="extra entry address (hex), repeatable")
-    ap.add_argument("--scan", action="store_true",
-                    help="also discover functions heuristically (jr-ra boundaries and "
-                    "function-pointer tables)")
-    ap.add_argument("--code-range", nargs=2, metavar=("LO", "HI"),
-                    help="only treat addresses in [LO, HI) (hex) as code; use "
-                    "tools/find_code_range.py to estimate it")
-    ap.add_argument("--blob", nargs=3, action="append", default=[],
-                    metavar=("SRC", "SIZE", "DEST"),
-                    help="code the game copies around at runtime: lift SIZE bytes found at SRC "
-                    "in the image as code located at DEST (repeatable)")
-    ap.add_argument("--blobs-file", metavar="FILE",
-                    help="file of 'SRC SIZE DEST' lines (written by the runtime as blobs.txt)")
-    ap.add_argument("--split", type=int, default=0, metavar="N",
-                    help="write N functions per generated_NNN.c file (use for big inputs)")
+    ap = argparse.ArgumentParser(description=(__doc__ or "r5900lift.py").split("\n")[0])
+    ap.add_argument("elf")
+    ap.add_argument("-o", "--output", default="out")
+    ap.add_argument("--scan", action="store_true")
+    ap.add_argument("--split", type=int, default=0)
+    ap.add_argument("--code-range", nargs=2, metavar=("LO", "HI"))
+    ap.add_argument("--entries")
+    ap.add_argument("--blobs-file")
+    ap.add_argument("--add", action="append", default=[])
+    ap.add_argument("--vu0-macro", action="store_true")
     a = ap.parse_args()
-    if a.sync_runtime:
-        for name in ("ps2rt.h", "ps2rt.c"):
-            write_if_changed(os.path.join(a.sync_runtime, name),
-                             open(os.path.join(HERE, "runtime", name)).read())
-        write_if_changed(os.path.join(a.sync_runtime, "Makefile"), makefile_text())
-        print(f"runtime files and Makefile synced into {a.sync_runtime}")
-        return
-    if not a.elf:
-        ap.error("the ELF argument is required")
-    if a.blobs_file and os.path.exists(a.blobs_file):
-        for line in open(a.blobs_file):
-            parts = line.split()
-            if len(parts) == 3 and parts not in a.blob:
-                a.blob.append(parts)
 
     elf = Elf(open(a.elf, "rb").read())
-    if a.code_range:
-        lo, hi = (int(x, 16) for x in a.code_range)
-        elf.code = {k: v for k, v in elf.code.items() if lo <= k < hi}
-        print(f"code range       : 0x{lo:08x}-0x{hi:08x} ({len(elf.code)} words)")
-    blob_entries = set()
-    for b in a.blob:
-        src, size, dest = (int(x, 0) for x in b)
-        for off in range(0, size, 4):
-            if src + off not in elf.data:
-                sys.exit(f"error: blob source 0x{src + off:08x} is not inside the image")
-            elf.code[dest + off] = elf.data[src + off]
-        blob_entries.add(dest)
-        print(f"blob             : 0x{size:x} bytes from 0x{src:08x} lifted as code at 0x{dest:08x}")
-    entries = ({elf.entry} | read_entries(a.entries) | {int(x, 16) for x in a.add}
-               | blob_entries)
-    for e in sorted(entries):
-        if e not in elf.code:
-            print(f"warning: entry 0x{e:08x} is outside the code range; ignored")
-    entries = {e for e in entries if e in elf.code}
-    funcs, covered = {}, set()
+    mem_words = dict(elf.data)
+    lo = elf.entry & ~3
+    while lo - 4 in mem_words:
+        lo -= 4
+    hi = elf.entry & ~3
+    while hi + 4 in mem_words:
+        hi += 4
+    hi += 4
+    code_lo, code_hi = (int(a.code_range[0], 0), int(a.code_range[1], 0)) if a.code_range else (lo, hi)
 
-    def grow(seeds):
-        """Analyse seeds and every function they call (direct calls are strong evidence)."""
-        work = list(seeds)
-        while work:
-            e = work.pop()
-            if e in funcs or e not in elf.code:
-                continue
-            entries.add(e)
-            funcs[e] = analyze(e, elf.code, entries)
-            covered.update(funcs[e][0])
-            work.extend(c for c in funcs[e][2] if c in elf.code and c not in funcs)
+    strong_seeds = {elf.entry} | {int(s, 0) for s in a.add}
+    if a.entries and os.path.exists(a.entries):
+        for line in open(a.entries):
+            tok = line.strip().split()
+            if tok and not tok[0].startswith("#"):
+                strong_seeds.add(int(tok[0], 0))
 
-    grow(sorted(entries))
-    seeds_msg = ""
+    blob_ranges = []
+    if a.blobs_file and os.path.exists(a.blobs_file):
+        for line in open(a.blobs_file):
+            tok = line.strip().split()
+            if len(tok) >= 3 and not tok[0].startswith("#"):
+                src, sz, dst = int(tok[0], 0), int(tok[1], 0), int(tok[2], 0)
+                for off in range(0, sz, 4):
+                    w = elf.get_word(src + off)
+                    if w is not None:
+                        mem_words[dst + off] = w
+                strong_seeds.add(dst)
+                blob_ranges.append((dst, dst + sz))
+
+    ptr_seeds, jt_seeds = set(), set()
     if a.scan:
-        sa, sb, sc = scan_seeds(elf, set(funcs))
-        grow(sorted(sb | sc))          # code pointers and table entries: always kept
-        kept = 0
-        for sd in sorted(sa):          # jr-ra boundaries: skip if already inside a function
-            if sd not in covered and sd not in funcs:
-                grow([sd])
-                kept += 1
-        seeds_msg = (f"scan seeds       : {len(sb)} pointer targets, {len(sc)} jump-table/vtable "
-                     f"entries; {len(sa)} jr-ra boundaries ({kept} kept, rest already inside "
-                     f"known functions)")
-        print(seeds_msg)
-    entries = set(funcs)
+        for addr, val in sorted(elf.data.items()):
+            if (val & 3) == 0 and code_lo <= val < code_hi and val in mem_words:
+                w = mem_words[val]
+                if w != 0 and not is_bad_word(w):
+                    nxt, prv = elf.data.get(addr + 4, 0), elf.data.get(addr - 4, 0)
+                    if (((nxt & 3) == 0 and code_lo <= nxt < code_hi) or
+                            ((prv & 3) == 0 and code_lo <= prv < code_hi)):
+                        jt_seeds.add(val)
+                    else:
+                        ptr_seeds.add(val)
+        strong_seeds |= ptr_seeds | jt_seeds
 
-    st = Stats()
-    os.makedirs(a.outdir, exist_ok=True)
-    texts = [lift_function(e, funcs[e][0], elf.code, entries, st) for e in sorted(funcs)]
-    cfiles = []
-    if a.split > 0:
-        for i in range(0, len(texts), a.split):
-            name = f"generated_{i // a.split:03d}.c"
-            write_if_changed(os.path.join(a.outdir, name),
-                             '#include "generated.h"\n\n' + "\n".join(texts[i:i + a.split]) + "\n")
-            cfiles.append(name)
+    eff_lo = min([code_lo] + [b[0] for b in blob_ranges])
+    eff_hi = max([code_hi] + [b[1] for b in blob_ranges])
+    func_entries, covered_pcs, work = set(), set(), deque(sorted(strong_seeds))
+    while work:
+        fn_addr = work.popleft()
+        if fn_addr in func_entries or fn_addr not in mem_words:
+            continue
+        if not any(blo <= fn_addr < bhi for blo, bhi in blob_ranges) and not (code_lo <= fn_addr < code_hi):
+            continue
+        func_entries.add(fn_addr)
+        vis, calls = trace_function(fn_addr, mem_words, eff_lo, eff_hi)
+        covered_pcs |= vis
+        for c in calls:
+            if c not in func_entries:
+                work.append(c)
+
+    jr_total = jr_kept = 0
+    if a.scan:
+        weak = []
+        for pc in range(code_lo, code_hi, 4):
+            if mem_words.get(pc) == JR_RA:
+                jr_total += 1
+                cand = pc + 8
+                if code_lo <= cand < code_hi and cand in mem_words and mem_words[cand] != 0:
+                    weak.append(cand)
+        for cand in weak:
+            if cand not in func_entries and cand not in covered_pcs:
+                jr_kept += 1
+                func_entries.add(cand)
+                vis, calls = trace_function(cand, mem_words, code_lo, code_hi)
+                covered_pcs |= vis
+                for c in calls:
+                    if c not in func_entries and code_lo <= c < code_hi and c in mem_words:
+                        func_entries.add(c)
+
+    sorted_funcs = sorted(func_entries)
+    os.makedirs(a.output, exist_ok=True)
+    repo_root = sys._MEIPASS if (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")) else os.path.dirname(os.path.abspath(__file__))
+    for rt_name in ("ps2rt.h", "ps2rt.c"):
+        src_rt = os.path.join(repo_root, "runtime", rt_name)
+        if os.path.exists(src_rt):
+            write_if_changed(os.path.join(a.output, rt_name), open(src_rt, encoding="utf-8").read())
+
+    prev_v1 = compute_prev_v1(mem_words)
+    unimpl_counts, syscalls_seen, total_insns, func_bodies = {}, set(), 0, []
+    for fn_addr in sorted_funcs:
+        body, n_ins = emit_function(
+            fn_addr, func_entries, mem_words, eff_lo, eff_hi,
+            unimpl_counts, syscalls_seen, prev_v1, a.vu0_macro,
+        )
+        func_bodies.append(body)
+        total_insns += n_ins
+
+    write_if_changed(
+        os.path.join(a.output, "generated.h"),
+        '#include "ps2rt.h"\n\n' + "\n".join(f"void f_{x:08x}(Ctx *ctx);" for x in sorted_funcs) + "\n",
+    )
+    keep = {f"generated_{i // a.split:03d}.c" for i in range(0, len(func_bodies), a.split)} if (a.split and a.split > 0) else {"generated.c"}
+    for fn in os.listdir(a.output):
+        if fn.startswith("generated") and fn.endswith(".c") and fn not in keep:
+            os.remove(os.path.join(a.output, fn))
+    if a.split and a.split > 0:
+        for idx in range(0, len(func_bodies), a.split):
+            write_if_changed(
+                os.path.join(a.output, f"generated_{idx // a.split:03d}.c"),
+                '#include "generated.h"\n\n' + "\n".join(func_bodies[idx:idx + a.split]),
+            )
     else:
-        write_if_changed(os.path.join(a.outdir, "generated.c"),
-                         '#include "generated.h"\n\n' + "\n".join(texts) + "\n")
-        cfiles.append("generated.c")
-    for old in os.listdir(a.outdir):  # stale files would cause duplicate symbols
-        if old.startswith("generated") and old.endswith(".c") and old not in cfiles:
-            os.remove(os.path.join(a.outdir, old))
-    hdr = ['#include "ps2rt.h"', ""]
-    hdr += [f"void f_{e:08x}(Ctx *ctx);" for e in sorted(funcs)]
-    tbl = ['#include "generated.h"', "",
-           f"const u32 ps2_entry_addr = 0x{elf.entry:08x}u;",
-           f"const u32 ps2_func_count = {len(funcs)};",
-           "const PS2FuncEntry ps2_func_table[] = {"]
-    # keys are physical-style (KUSEG/KSEG0/KSEG1 aliases of one address share a key)
-    tbl += [f"  {{0x{e & 0x1FFFFFFF:08x}u, f_{e:08x}}},"
-            for e in sorted(funcs, key=lambda x: x & 0x1FFFFFFF)] + ["};"]
-    for name, lines in (("generated.h", hdr), ("func_table.c", tbl)):
-        write_if_changed(os.path.join(a.outdir, name), "\n".join(lines) + "\n")
-    write_if_changed(os.path.join(a.outdir, "Makefile"), makefile_text())
-    for name in ("ps2rt.h", "ps2rt.c"):
-        write_if_changed(os.path.join(a.outdir, name),
-                         open(os.path.join(HERE, "runtime", name)).read())
+        write_if_changed(
+            os.path.join(a.output, "generated.c"),
+            '#include "generated.h"\n\n' + "\n".join(func_bodies),
+        )
 
-    rep = [f"entry point      : 0x{elf.entry:08x}",
-           f"functions        : {len(funcs)}",
-           f"instructions     : {st.total} ({st.ok} lifted, {st.total - st.ok} unimplemented)",
-           f"indirect jumps   : {len(st.indirect)} (resolved at runtime via ps2_dispatch)"]
-    if seeds_msg:
-        rep.append(seeds_msg)
-    rep += ["", "Unimplemented instruction classes (count, first address):"]
-    for name, (n, pc) in sorted(st.unimpl.items(), key=lambda kv: -kv[1][0]):
-        rep.append(f"  {n:7d}  0x{pc:08x}  {name}")
-    rep += ["", "BIOS syscalls via `syscall` (number, sites, first address):"]
-    for num, (n, pc) in sorted(st.sys.items(), key=lambda kv: -kv[1][0]):
-        label = "computed at runtime" if num is None else f"{num} (0x{num & 0xFFFF:x})"
-        rep.append(f"  {n:7d}  0x{pc:08x}  {label}")
-    open(os.path.join(a.outdir, "lift_report.txt"), "w").write("\n".join(rep) + "\n")
-    print("\n".join(rep[:5 if seeds_msg else 4]))
-    if st.unimpl:
-        print(f"{len(st.unimpl)} unimplemented instruction classes -> see lift_report.txt")
-    print(f"build: make -C {a.outdir} -j8   (add CFLAGS=-O0 for a faster, unoptimised build)")
+    table_entries = sorted((fn_addr & 0x1FFFFFFF, fn_addr) for fn_addr in sorted_funcs)
+    ft = [
+        '#include "generated.h"', "",
+        f"const u32 ps2_entry_addr = 0x{elf.entry:08x}u;",
+        f"const u32 ps2_func_count = {len(table_entries)};",
+        "const PS2FuncEntry ps2_func_table[] = {",
+        *[f"  {{0x{k:08x}u, f_{fn:08x}}}," for k, fn in table_entries],
+        "};\n",
+    ]
+    write_if_changed(os.path.join(a.output, "func_table.c"), "\n".join(ft))
+
+    write_if_changed(
+        os.path.join(a.output, "Makefile"),
+        "CC ?= cc\nCFLAGS ?= -O1 -w\nLDFLAGS ?= -rdynamic -pthread\n"
+        "SRC := $(wildcard generated*.c) func_table.c ps2rt.c\nOBJ := $(SRC:.c=.o)\n\n"
+        "game: $(OBJ)\n\t$(CC) $(LDFLAGS) -o $@ $(OBJ) -lm\n\n"
+        "%.o: %.c ps2rt.h\n\t$(CC) $(CFLAGS) -c $< -o $@\n\n"
+        "clean:\n\trm -f $(OBJ) game\n",
+    )
+
+    unimpl_total = sum(v[0] for v in unimpl_counts.values())
+    rep = [
+        f"entry point      : 0x{elf.entry:08x}",
+        f"functions        : {len(sorted_funcs)}",
+        f"instructions     : {total_insns} ({total_insns - unimpl_total} lifted, {unimpl_total} unimplemented)",
+    ]
+    if a.code_range:
+        rep.append(f"code range       : 0x{code_lo:08x}-0x{code_hi:08x}")
+    if a.scan:
+        rep.append(
+            f"scan seeds       : {len(ptr_seeds)} pointer targets, {len(jt_seeds)} jump-table/vtable entries; "
+            f"{jr_total} jr-ra boundaries ({jr_kept} kept, rest already inside known functions)"
+        )
+    if syscalls_seen:
+        rep.append("\nBIOS syscall inventory:")
+        rep.extend(f"  (0x{sc:04x})" for sc in sorted(syscalls_seen))
+    if unimpl_counts:
+        rep.append("\nUnimplemented instruction classes (count, first address):")
+        for lbl, (cnt, fpc) in sorted(unimpl_counts.items(), key=lambda kv: -kv[1][0]):
+            rep.append(f"  {cnt:7d}  0x{fpc:08x}  {lbl}")
+    write_if_changed(os.path.join(a.output, "lift_report.txt"), "\n".join(rep) + "\n")
+
+    print(f"entry point      : 0x{elf.entry:08x}")
+    if a.code_range:
+        print(f"code range       : 0x{code_lo:08x}-0x{code_hi:08x}")
+    print(f"functions        : {len(sorted_funcs)}")
+    print(f"instructions     : {total_insns} ({total_insns - unimpl_total} lifted, {unimpl_total} unimplemented)")
+    print(f"written to       : {a.output}")
 
 
 if __name__ == "__main__":
